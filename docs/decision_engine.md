@@ -35,6 +35,28 @@ The cascade runs in this order. First trip wins.
 6. **Nothing tripped** → `auto_apply` (confidence 0.97)
    Non-sensitive resource replacements (destroy+create on something that isn't IAM/OIDC) still get logged as `info`-level flags for visibility but don't block the apply.
 
+## How it diffs a change
+
+Diffing happens at two different levels, and only one of them is a real semantic diff.
+
+**Plan-level diff — already done by Terraform.** `terraform show -json` carries a `before` and `after` attribute snapshot for every changed resource. `plan_parser.py` reads that into `ResourceChange.before` / `.after`. Guardian doesn't diff two live infrastructure states itself — it consumes the diff Terraform already computed and extracts the fields it needs (resource type, action, whether it has a trust policy, and so on).
+
+**OIDC trust-policy diff — Guardian's own semantic diff.** For any resource where `has_trust_policy` or `is_oidc_provider` is true, `decision_engine.py` pulls `before["assume_role_policy"]` and `after["assume_role_policy"]` and passes both to `diff_trust_policy()` in `oidc_diff.py`. It returns:
+
+- `changed` — whether the policy differs at all
+- `widened` — whether it got more permissive, not just different
+- `before.patterns` / `after.patterns` — the condition patterns (e.g. which repos/branches/subjects can assume the role) parsed out of each policy version
+- `examples_newly_allowed` — concrete identities that could assume the role after the change but couldn't before
+
+`widened` can't come from a plain string or JSON compare — two policies can differ syntactically while permitting the exact same callers, or differ by one character and permit a strictly larger set. The `examples_newly_allowed` field only makes sense if the diff is comparing the *set of allowed callers* implied by each policy's condition block (for GitHub OIDC, typically the `token.actions.githubusercontent.com:sub` claim pattern), not the raw JSON.
+
+**Everything else is cheaper than a diff.**
+- New-resource-type check: a plain set difference, `parsed_plan.new_resource_types - known_resource_types` — comparing type *names*, not configurations.
+- IAM-touched check: resource type category plus the plan's `actions` list (create/update/delete) — it doesn't inspect what the permission change actually does.
+- Cost check: not a diff of the plan at all. `CostEstimateResult.delta_usd` compares an estimated baseline against the post-change estimate, computed separately from plan parsing.
+
+So real semantic diffing — does this specific change expand who can do what — only happens for OIDC trust policies, and only inside `oidc_diff.py`.
+
 ## Notes
 
 - **Confidence is informational, not a gate.** Nothing in `evaluate()` reads confidence back to change the action. It's there for the reviewer (or the downstream LLM explanation) to weigh, not for the engine to weigh against itself.
