@@ -1,4 +1,4 @@
-# Infra Cost Guardian
+# Infra Risk Guardian
 
 A single-purpose agent that intercepts every `terraform plan`, decides
 **auto-apply vs. hold-for-human**, and is provably right about the one thing
