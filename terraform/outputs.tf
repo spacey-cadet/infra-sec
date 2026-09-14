@@ -1,6 +1,11 @@
 output "apply_role_arn" {
-  description = "ARN of the scoped OIDC apply role. Put this in your GitHub Actions workflow's `role-to-assume` input."
+  description = "ARN of the scoped OIDC apply role for the future auto-apply path. The plan-submission workflow should use plan_submitter_role_arn instead."
   value       = aws_iam_role.terraform_apply.arn
+}
+
+output "plan_submitter_role_arn" {
+  description = "ARN of the scoped OIDC role the watched repo assumes to upload plan JSON and send an SQS message."
+  value       = aws_iam_role.plan_submitter.arn
 }
 
 output "plan_queue_url" {

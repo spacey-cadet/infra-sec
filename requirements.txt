@@ -1,1 +1,2 @@
 boto3>=1.34.0
+strands-agents>=1.0.0

@@ -16,12 +16,13 @@ import traceback
 
 import boto3
 
-from .plan_parser import parse_plan_json, ParsedPlan
-from .cost_estimate import estimate_cost_delta, CostEstimateResult
+from .plan_parser import ParsedPlan
+from .cost_estimate import CostEstimateResult
 from .decision_engine import evaluate, Decision, RiskFlag
 from .dynamo_store import put_decision, get_known_resource_types, DecisionRecord, now_iso
 from .notify import notify
 from .github_client import post_check_run, post_pr_comment
+from .strands_agent import run_guardian_review
 
 APPLY_ROLE_ARN = os.environ.get("GUARDIAN_APPLY_ROLE_ARN", "")
 
@@ -65,20 +66,19 @@ def _process(event_body: dict) -> dict:
     plan_id = event_body.get("plan_id") or head_sha or "unknown-plan"
     baseline_usd = float(event_body.get("baseline_usd", 5.0))
 
+    known_types = get_known_resource_types(repo)
     try:
         raw_plan_json = _fetch_plan_json(event_body)
-        parsed = parse_plan_json(raw_plan_json)
+        review = run_guardian_review(raw_plan_json, baseline_usd, known_types)
+        parsed = review.parsed_plan
+        decision = review.decision
     except Exception as e:  # noqa: BLE001 (deliberate catch-all, fail closed)
-        parsed = ParsedPlan(parse_ok=False, parse_error=f"unhandled fetch/parse error: {e}")
-
-    known_types = get_known_resource_types(repo)
-
-    if parsed.parse_ok:
-        cost_result = estimate_cost_delta(parsed.resource_changes, baseline_usd)
-        decision = evaluate(parsed, cost_result, known_types)
-    else:
-        cost_result = CostEstimateResult(delta_usd=0.0, baseline_usd=baseline_usd, pct_of_baseline=0.0, method="n/a")
-        decision = evaluate(parsed, cost_result, known_types)
+        parsed = ParsedPlan(parse_ok=False, parse_error=f"unhandled fetch/review error: {e}")
+        decision = evaluate(
+            parsed,
+            CostEstimateResult(delta_usd=0.0, baseline_usd=baseline_usd, pct_of_baseline=0.0, method="n/a"),
+            known_types,
+        )
 
     record = DecisionRecord(
         repo=repo,

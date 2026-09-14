@@ -166,19 +166,22 @@ plan holds; any one of them alone is already sufficient to hold.
 
 ```
 GitHub Actions (PR opened)
+  └─ assume guardian plan-submitter role via GitHub OIDC
   └─ terraform plan -out=tfplan.binary
   └─ terraform show -json tfplan.binary > plan.json
-  └─ push {repo, pr_number, head_sha, plan_json | plan_json_s3_uri} → SQS
+  └─ upload plan.json → S3 plan bucket
+  └─ push {repo, pr_number, head_sha, plan_json_s3_uri} → SQS
                                 │
                                 ▼
                      SQS queue (terraform-guardian-plan-queue)
                                 │
                                 ▼
                 Lambda (container image, agent/handler.py)
-                   1. plan_parser.py     (structured extraction)
-                   2. oidc_diff.py        (deterministic trust-policy diff)
-                   3. cost_estimate.py    (Infracost or heuristic fallback)
-                   4. decision_engine.py  (escalation matrix, OR-gate, fail-closed)
+                   └─ Strands Agent wrapper (agent/strands_agent.py)
+                      tools:
+                      1. terraform_plan_parse     (structured extraction)
+                      2. terraform_cost_estimate  (Infracost or heuristic fallback)
+                      3. guardian_decision        (escalation matrix, OR-gate, fail-closed)
                                 │
                     ┌───────────┴────────────┐
                     ▼                        ▼
@@ -212,6 +215,7 @@ agent/
   oidc_diff.py         oidc_trust_diff: deterministic semantic diff of sub/aud conditions
   cost_estimate.py     cost_estimate: Infracost wrapper plus offline heuristic fallback
   decision_engine.py   the escalation matrix as plain, testable Python (OR-gate, fail-closed)
+  strands_agent.py     Strands Agents SDK wrapper exposing the deterministic review tools
   dynamo_store.py      dynamo_decision_log: decision history plus human_override feedback loop
   notify.py            sns_notify: the single escalation channel (Slack/email via SNS)
   github_client.py     github_api: posts a Check Run and PR comment so reviewers see it in-review
@@ -221,9 +225,11 @@ terraform/
   oidc.tf              GitHub Actions OIDC provider plus the scoped apply-role trust policy
                           (the "what good looks like" reference for the demo)
   iam.tf               least-privilege policies for the apply role and the Lambda exec role
+  plan_submitter.tf    scoped OIDC role for watched repos to upload plan JSON and send SQS
   dynamodb.tf, sns.tf, sqs.tf, s3.tf, lambda.tf, outputs.tf
   variables.tf, provider.tf, terraform.tfvars.example
-.github/workflows/terraform-guardian.yml   the CI trigger: plan to JSON to SQS
+examples/terraform-guardian.yml   copy/paste workflow for the watched repo
+docs/workflow.md                  end-to-end explanation of the guardian/watched-repo flow
 tests/
   fixtures/plan_safe.json          boring Lambda memory bump -> auto_apply
   fixtures/plan_cost.json           new NAT gateway -> hold (cost + new-resource-type)
@@ -237,12 +243,13 @@ tests/
 ## Running the tests (no AWS account required)
 
 ```bash
-pip install boto3   # only dependency; boto3 is stubbed out in these tests
+pip install -r requirements.txt
 python3 -m pytest tests/ -v
 # or, without pytest installed:
 python3 tests/test_plan_parser.py
 python3 tests/test_oidc_diff.py
 python3 tests/test_decision_engine.py
+python3 tests/test_strands_agent.py
 ```
 
 All five decision-engine tests and the OIDC-diff tests pass against the
@@ -288,7 +295,7 @@ Cost impact: +$0.00/mo (est.)
 - A GitHub repo you want the guardian to watch, plus permission to add
   repo variables/secrets and branch protection rules.
 
-### 1. Bootstrap the AWS stack
+### 1. Bootstrap the ECR repository
 
 ```bash
 cd terraform
@@ -296,8 +303,7 @@ cp terraform.tfvars.example terraform.tfvars
 # edit terraform.tfvars: github_org, github_repo, allowed_ref, notification_email
 
 terraform init
-terraform apply   # guardian_image_uri is blank on first apply; that's expected,
-                   # this creates the ECR repo the image gets pushed to.
+terraform apply -target=aws_ecr_repository.guardian
 ```
 
 ### 2. Build and push the Lambda image
@@ -307,9 +313,13 @@ cd ..
 aws ecr get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin <ecr_repository_url from output>
 
-docker build -t terraform-guardian-agent .
-docker tag terraform-guardian-agent:latest <ecr_repository_url>:latest
-docker push <ecr_repository_url>:latest
+docker buildx build \
+  --platform linux/amd64 \
+  --provenance=false \
+  --sbom=false \
+  -t <ecr_repository_url>:latest \
+  --push \
+  .
 ```
 
 ### 3. Point Lambda at the pushed image
@@ -319,18 +329,30 @@ cd terraform
 terraform apply -var="guardian_image_uri=<ecr_repository_url>:latest"
 ```
 
+If Lambda rejects the image with
+`InvalidParameterValueException: The image manifest, config or layer media type
+for the source image is not supported`, rebuild and push it with the exact
+`docker buildx build` command above. Lambda requires a single-platform image
+manifest for its architecture; multi-architecture indexes and BuildKit
+attestation/provenance manifests can trigger this error.
+
 ### 4. Wire up the watched repo's GitHub Actions
 
 - Add repo variables (Settings → Secrets and variables → Actions → Variables):
-  - `GUARDIAN_APPLY_ROLE_ARN` = `apply_role_arn` output
+  - `GUARDIAN_PLAN_SUBMITTER_ROLE_ARN` = `plan_submitter_role_arn` output
   - `GUARDIAN_QUEUE_URL` = `plan_queue_url` output
   - `GUARDIAN_PLAN_BUCKET` = `plan_artifacts_bucket` output
-- Copy `.github/workflows/terraform-guardian.yml` into the watched repo
+- Copy `examples/terraform-guardian.yml` into the watched repo
   (adjust the `working-directory` if your Terraform lives somewhere other
   than `./infra`).
 - Add "Infra Cost Guardian" as a **required status check** in branch
   protection rules, so a `hold` verdict actually blocks merge instead of
   just posting a comment.
+
+The workflow template is intentionally kept under `examples/`, not
+`.github/workflows/`, so this guardian repo does not accidentally run the
+watched-repo workflow when you push it. See `docs/workflow.md` for the full
+guardian repo vs. watched repo explanation.
 
 ### 5. (Optional) GitHub API token for check runs / PR comments
 

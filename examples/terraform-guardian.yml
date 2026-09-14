@@ -1,0 +1,85 @@
+name: Infra Cost Guardian
+
+on:
+  pull_request:
+    paths:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".terraform.lock.hcl"
+      - ".github/workflows/terraform-guardian.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: read
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_WORKING_DIR: ./infra
+  PR_NUMBER: ${{ github.event.pull_request.number || 'manual' }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GUARDIAN_PLAN_SUBMITTER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        run: terraform plan -input=false -out=tfplan.binary
+
+      - name: Export plan JSON
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        run: terraform show -json tfplan.binary > plan.json
+
+      - name: Upload plan JSON
+        id: upload-plan
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        env:
+          PLAN_BUCKET: ${{ vars.GUARDIAN_PLAN_BUCKET }}
+        run: |
+          key="plans/${GITHUB_REPOSITORY}/${PR_NUMBER}/${HEAD_SHA}.json"
+          aws s3 cp plan.json "s3://${PLAN_BUCKET}/${key}"
+          echo "plan_s3_uri=s3://${PLAN_BUCKET}/${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Send plan to guardian
+        env:
+          GUARDIAN_QUEUE_URL: ${{ vars.GUARDIAN_QUEUE_URL }}
+          PLAN_S3_URI: ${{ steps.upload-plan.outputs.plan_s3_uri }}
+        run: |
+          body="$(
+            jq -nc \
+              --arg repo "$GITHUB_REPOSITORY" \
+              --arg pr_number "$PR_NUMBER" \
+              --arg head_sha "$HEAD_SHA" \
+              --arg plan_id "$HEAD_SHA" \
+              --arg plan_json_s3_uri "$PLAN_S3_URI" \
+              '{
+                repo: $repo,
+                pr_number: $pr_number,
+                head_sha: $head_sha,
+                plan_id: $plan_id,
+                plan_json_s3_uri: $plan_json_s3_uri
+              }'
+          )"
+          aws sqs send-message \
+            --queue-url "$GUARDIAN_QUEUE_URL" \
+            --message-body "$body"
