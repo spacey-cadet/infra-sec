@@ -65,22 +65,20 @@ Open `docs/workflow.md`.
 
 Say:
 
-> There are two repos. This is the guardian repo: it deploys Lambda, SQS, S3,
-> DynamoDB, SNS, and the IAM role a watched repo can assume. The watched repo
-> copies the workflow template from `examples/terraform-guardian.yml`.
+> Infra Risk is deployed once as a decision API, with DynamoDB for decision
+> history, SNS for holds, and a scoped role a watched repo can assume. The
+> watched repo uses the small client workflow in `examples/infra-risk.yml`.
 
 Show the full path:
 
 ```text
 PR in watched repo
-  -> GitHub Actions assumes plan submitter role
+  -> GitHub Actions assumes decision-client role through OIDC
   -> Terraform creates plan.json
-  -> plan.json uploads to S3
-  -> SQS receives pointer to plan.json
-  -> Lambda is invoked by SQS
-  -> Strands agent tools review the plan
+  -> infra-risk Python client signs a request to the decision API
+  -> Lambda runs deterministic plan, cost and OIDC checks
   -> decision is stored in DynamoDB
-  -> safe plans auto-apply path, risky plans hold and notify
+  -> holds notify; decisions return to CI as JSON
 ```
 
 ### 1:45-2:40 - Safe Plan
@@ -140,24 +138,23 @@ Show these files:
 
 ```text
 terraform/plan_submitter.tf
-terraform/sqs.tf
-terraform/s3.tf
 terraform/lambda.tf
 agent/handler.py
+infra_risk/cli.py
 ```
 
 Say:
 
-> In production, the watched repo never calls Lambda directly. It assumes a
-> narrowly scoped plan submitter role, uploads `plan.json` to S3, and sends an
-> SQS pointer. SQS invokes Lambda. Lambda runs the same Strands-backed review
-> path shown in the local demo.
+> The pipeline assumes a narrowly scoped role, then the client signs and posts
+> the plan to the decision endpoint. The deterministic checks control the
+> decision. Optionally, the CI runner can attach a local GLiNER2.5-Decide
+> classification as advisory context; it cannot change the decision.
 
 ### 4:40-5:00 - Close
 
 Say:
 
-> Infra Cost Guardian removes routine Terraform review from the human queue
+> Infra Risk removes routine Terraform review from the human queue
 > while protecting the dangerous edge cases. It saves developer time on boring
 > changes and reserves attention for real infrastructure risk.
 

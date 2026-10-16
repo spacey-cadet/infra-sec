@@ -23,7 +23,7 @@ import os
 import boto3
 from boto3.dynamodb.conditions import Key
 
-TABLE_NAME = os.environ.get("GUARDIAN_TABLE_NAME", "terraform-guardian-decisions")
+TABLE_NAME = os.environ.get("GUARDIAN_TABLE_NAME", "infra-risk-decisions")
 
 
 def _table():

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infra-risk"
+version = "0.1.0"
+description = "Lightweight CI client for the Infra Risk Terraform decision API"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+aws = ["boto3>=1.34.0"]
+gliner = ["boto3>=1.34.0", "gliner2[local]"]
+strands = ["strands-agents>=1.0.0"]
+
+[project.scripts]
+infra-risk = "infra_risk.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["infra_risk*"]

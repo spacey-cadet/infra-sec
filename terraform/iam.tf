@@ -5,7 +5,7 @@
 # guardian could watch too.
 
 # This starter policy is scoped to the services this reference stack
-# provisions (Lambda, DynamoDB, SNS, SQS, S3, IAM-read). Extend it
+# provisions (Lambda, DynamoDB, SNS, IAM-read). Extend it
 # per-project to match exactly what the watched repo's Terraform needs to
 # manage, and resist the urge to attach a broad managed policy here.
 data "aws_iam_policy_document" "terraform_apply_scoped" {
@@ -98,13 +98,6 @@ data "aws_iam_policy_document" "guardian_lambda_permissions" {
   }
 
   statement {
-    sid    = "SqsConsume"
-    effect = "Allow"
-    actions = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
-    resources = [aws_sqs_queue.plan_queue.arn]
-  }
-
-  statement {
     sid       = "DynamoReadWrite"
     effect    = "Allow"
     actions   = ["dynamodb:PutItem", "dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:GetItem"]
@@ -118,12 +111,6 @@ data "aws_iam_policy_document" "guardian_lambda_permissions" {
     resources = [aws_sns_topic.hold_notifications.arn]
   }
 
-  statement {
-    sid       = "S3ReadPlans"
-    effect    = "Allow"
-    actions   = ["s3:GetObject"]
-    resources = ["${aws_s3_bucket.plan_artifacts.arn}/*"]
-  }
 }
 
 resource "aws_iam_role_policy" "guardian_lambda_permissions" {

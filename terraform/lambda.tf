@@ -1,4 +1,6 @@
 resource "aws_cloudwatch_log_group" "guardian" {
+  # Keep the deployed function/log/ECR physical names stable across the API
+  # interface change; Terraform would otherwise replace these resources.
   name              = "/aws/lambda/${var.project_name}-agent"
   retention_in_days = var.log_retention_days
 }
@@ -10,7 +12,7 @@ resource "aws_lambda_function" "guardian" {
   memory_size   = 512
 
   package_type = "Image"
-  image_uri    = var.guardian_image_uri != "" ? var.guardian_image_uri : "${aws_ecr_repository.guardian.repository_url}:latest"
+  image_uri    = var.infra_risk_image_uri != "" ? var.infra_risk_image_uri : "${aws_ecr_repository.guardian.repository_url}:latest"
 
   environment {
     variables = {
@@ -28,6 +30,26 @@ resource "aws_lambda_function" "guardian" {
   tags = {
     Project = var.project_name
   }
+}
+
+resource "aws_lambda_function_url" "decision_api" {
+  function_name      = aws_lambda_function.guardian.function_name
+  authorization_type = "AWS_IAM"
+}
+
+resource "aws_lambda_permission" "decision_api_client" {
+  statement_id           = "AllowDecisionClientFunctionUrl"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.guardian.function_name
+  principal              = "*"
+  function_url_auth_type = "AWS_IAM"
+}
+
+resource "aws_lambda_permission" "decision_api_client_invoke" {
+  statement_id  = "AllowDecisionClientInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.guardian.function_name
+  principal     = "*"
 }
 
 resource "aws_ecr_repository" "guardian" {

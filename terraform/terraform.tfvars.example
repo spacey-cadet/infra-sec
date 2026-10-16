@@ -2,7 +2,7 @@ aws_region          = "us-east-1"
 github_org          = "your-org-or-username"
 github_repo         = "your-infra-repo"
 allowed_ref         = "refs/heads/main"
-project_name        = "terraform-guardian"
+project_name        = "infra-risk"
 notification_email  = "you@example.com"
-# guardian_image_uri is left blank until the first `docker push` to the
+# infra_risk_image_uri is left blank until the first image push to the
 # ECR repo created by this stack; see README "Bootstrapping" section.

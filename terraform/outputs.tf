@@ -1,21 +1,16 @@
 output "apply_role_arn" {
-  description = "ARN of the scoped OIDC apply role for the future auto-apply path. The plan-submission workflow should use plan_submitter_role_arn instead."
+  description = "ARN of the scoped OIDC apply role for the future apply integration."
   value       = aws_iam_role.terraform_apply.arn
 }
 
 output "plan_submitter_role_arn" {
-  description = "ARN of the scoped OIDC role the watched repo assumes to upload plan JSON and send an SQS message."
+  description = "ARN of the scoped OIDC role assumed by the Infra Risk client to invoke the decision API."
   value       = aws_iam_role.plan_submitter.arn
 }
 
-output "plan_queue_url" {
-  description = "SQS queue URL that the GitHub Actions workflow pushes plan JSON to."
-  value       = aws_sqs_queue.plan_queue.url
-}
-
-output "plan_artifacts_bucket" {
-  description = "S3 bucket for large plan JSON artifacts."
-  value       = aws_s3_bucket.plan_artifacts.bucket
+output "decision_api_url" {
+  description = "IAM-authenticated Infra Risk decision endpoint URL."
+  value       = aws_lambda_function_url.decision_api.function_url
 }
 
 output "decisions_table_name" {
@@ -29,10 +24,10 @@ output "hold_notifications_topic_arn" {
 }
 
 output "ecr_repository_url" {
-  description = "Push the guardian Lambda container image here, then set guardian_image_uri and re-apply."
+  description = "ECR repository for the Infra Risk decision API container image."
   value       = aws_ecr_repository.guardian.repository_url
 }
 
-output "guardian_lambda_name" {
+output "infra_risk_lambda_name" {
   value = aws_lambda_function.guardian.function_name
 }

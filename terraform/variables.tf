@@ -21,13 +21,13 @@ variable "allowed_ref" {
 }
 
 variable "project_name" {
-  description = "Name prefix for all resources in this stack."
+  description = "Name prefix for all Infra Risk resources."
   type        = string
-  default     = "terraform-guardian"
+  default     = "infra-risk"
 }
 
-variable "guardian_image_uri" {
-  description = "ECR image URI for the guardian Lambda container (built from the repo's Dockerfile). Leave blank on first apply and fill in after the first `docker push`."
+variable "infra_risk_image_uri" {
+  description = "ECR image URI for the Infra Risk decision API Lambda container. Leave blank on first apply and fill in after the first push."
   type        = string
   default     = ""
 }

@@ -1,0 +1,43 @@
+name: Infrastructure decision
+
+on:
+  pull_request:
+    paths:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".terraform.lock.hcl"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_WORKING_DIR: ./infra
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.INFRA_RISK_CLIENT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform plan
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        run: |
+          terraform init -input=false
+          terraform plan -input=false -out=tfplan.binary
+          terraform show -json tfplan.binary > plan.json
+      - name: Install Infra Risk client
+        run: pip install 'infra-risk[aws] @ git+https://github.com/YOUR_ORG/infra-risk.git'
+      - name: Ask Infra Risk for a decision
+        env:
+          INFRA_RISK_API_URL: ${{ vars.INFRA_RISK_API_URL }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '0' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        run: infra-risk --plan plan.json

@@ -1,152 +1,61 @@
-# Infra Cost Guardian Workflow
+# Infra Risk pipeline integration
 
-This project has two repos in mind:
+Infra Risk is deployed once. A watched repository needs a Terraform plan and a
+small Python client invocation; it does not need a separate guardian workflow
+that uploads plans to S3 and queues them through SQS.
 
-- **Guardian repo**: this repo. It contains the Lambda agent, Terraform for
-  the AWS resources, and the copy/paste workflow template.
-- **Watched repo**: the repo that contains Terraform you want protected.
-  This is where the GitHub Actions workflow actually runs.
+## Pipeline
 
-The workflow template belongs in the watched repo, not in this guardian repo:
+1. The CI job runs `terraform plan` and exports `terraform show -json` output.
+2. GitHub Actions assumes the scoped `decision-client` role using OIDC.
+3. The `infra-risk` package signs a request to the AWS_IAM-protected Lambda
+   Function URL with SigV4.
+4. Infra Risk parses the plan, estimates cost, applies its deterministic risk
+   gates, and returns the decision JSON. It logs the decision and reports it
+   to GitHub/SNS using the configured integrations.
 
-```text
-guardian repo
-  agent/
-  terraform/
-  examples/terraform-guardian.yml
-  docs/workflow.md
+The deterministic evaluator remains the only authority for `hold` and
+`auto_apply`. Optionally, the pipeline client can run Fastino's open-weight
+`fastino/GLiNER2.5-Decide` checkpoint locally and attach its classification as
+an advisory. The optional model requires installing `infra-risk[gliner]` and
+setting `INFRA_RISK_GLINER_MODEL=fastino/GLiNER2.5-Decide`; it adds model
+download and PyTorch overhead to the runner. The default `infra-risk[aws]`
+client has no model dependency.
 
-watched repo
-  .github/workflows/terraform-guardian.yml
-  infra/
+## CI client
+
+Copy `examples/infra-risk.yml` into the consuming repo's workflow directory.
+Set repository variables `INFRA_RISK_CLIENT_ROLE_ARN` and
+`INFRA_RISK_API_URL`. Replace the example package Git URL with the canonical
+Infra Risk repository URL. The assumed role trust is scoped to the configured
+GitHub org/repo and pull request/ref subjects.
+
+For another CI system, install the package and run:
+
+```sh
+pip install 'infra-risk[aws] @ git+https://github.com/YOUR_ORG/infra-risk.git'
+terraform show -json tfplan.binary > plan.json
+infra-risk --plan plan.json --api-url "$INFRA_RISK_API_URL"
 ```
 
-## What The Guardian Repo Deploys
+The command exits `0` for `auto_apply`, `2` for `hold`, and nonzero on API or
+credential errors. Treat every nonzero exit as a blocked pipeline.
 
-The guardian repo creates the AWS side:
+## API payload
 
-- Lambda container running the Strands-backed guardian agent
-- SQS queue for plan-review requests
-- S3 bucket for full Terraform plan JSON files
-- DynamoDB table for decision history
-- SNS topic for hold notifications
-- GitHub OIDC provider
-- Plan submitter IAM role for watched repos
-- Apply IAM role for the future auto-apply path
-
-The important role for the watched repo is:
-
-```text
-plan_submitter_role_arn
-```
-
-That role can only:
-
-```text
-s3:PutObject
-sqs:SendMessage
-```
-
-It cannot apply infrastructure. It only lets the watched repo hand a plan to
-the guardian.
-
-## What The Watched Repo Does
-
-The watched repo copies:
-
-```text
-examples/terraform-guardian.yml
-```
-
-to:
-
-```text
-.github/workflows/terraform-guardian.yml
-```
-
-Then it adds these GitHub Actions variables:
-
-```text
-GUARDIAN_PLAN_SUBMITTER_ROLE_ARN = terraform output plan_submitter_role_arn
-GUARDIAN_QUEUE_URL               = terraform output plan_queue_url
-GUARDIAN_PLAN_BUCKET             = terraform output plan_artifacts_bucket
-```
-
-When a pull request changes Terraform, GitHub Actions:
-
-1. Assumes `GUARDIAN_PLAN_SUBMITTER_ROLE_ARN` through GitHub OIDC.
-2. Runs `terraform plan -out=tfplan.binary`.
-3. Runs `terraform show -json tfplan.binary > plan.json`.
-4. Uploads `plan.json` to the guardian S3 bucket.
-5. Sends an SQS message pointing to the uploaded plan JSON.
-
-The SQS message looks like:
+`POST` JSON to the Function URL. The minimum request is:
 
 ```json
 {
-  "repo": "your-org/your-watched-repo",
+  "repo": "org/repo",
   "pr_number": "12",
-  "head_sha": "abc123",
-  "plan_id": "abc123",
-  "plan_json_s3_uri": "s3://terraform-guardian-plan-artifacts-123456789/plans/your-org/your-watched-repo/12/abc123.json"
+  "head_sha": "commit-sha",
+  "plan_json": "{...terraform show -json output...}",
+  "baseline_usd": 5.0
 }
 ```
 
-## What The Guardian Agent Does
-
-The SQS queue invokes Lambda automatically. Lambda downloads the plan JSON
-from S3 and passes it through the Strands agent wrapper in
-`agent/strands_agent.py`.
-
-The Strands-exposed tools are:
-
-- `terraform_plan_parse`: extracts normalized resource changes from the
-  Terraform JSON plan.
-- `terraform_cost_estimate`: estimates the monthly cost delta.
-- `guardian_decision`: applies the deterministic escalation matrix.
-
-The final decision is always one of:
-
-```text
-auto_apply
-hold
-```
-
-For a safe change, the agent records an `auto_apply` decision. For risky
-changes, such as an IAM/OIDC trust-policy widening or a cost spike, it records
-`hold`, sends an SNS notification, and posts GitHub feedback when a token is
-configured.
-
-## Why The Workflow Is Not Active In This Repo
-
-This repo is the guardian repo. If the workflow lived at:
-
-```text
-.github/workflows/terraform-guardian.yml
-```
-
-then GitHub would run it whenever this repo is pushed or receives a PR. That
-would be confusing because this repo is not necessarily the watched repo.
-
-Instead, the workflow lives at:
-
-```text
-examples/terraform-guardian.yml
-```
-
-That makes it a template. Users copy it into whichever repo they want the
-guardian to watch.
-
-## Full Path
-
-```text
-PR in watched repo
-  -> GitHub Actions assumes plan submitter role
-  -> Terraform creates plan.json
-  -> plan.json uploads to S3
-  -> SQS receives pointer to plan.json
-  -> Lambda is invoked by SQS
-  -> Strands agent tools review the plan
-  -> decision is stored in DynamoDB
-  -> safe plans auto-apply path, risky plans hold and notify
-```
+The response includes `action`, `reasoning`, `risk_flags`, cost impact, and
+OIDC trust-policy diff details when applicable. Function URL authentication
+uses AWS IAM; clients need the scoped OIDC role and SigV4. Keep the request
+within the Lambda Function URL payload limit.

@@ -1,8 +1,8 @@
-"""Lambda entry point.
+"""Infra Risk decision API Lambda entry point.
 
-Triggered by an SQS message containing {repo, pr_number, head_sha,
-plan_json_s3_uri (or inline plan_json), baseline_usd}, pushed by the
-GitHub Actions workflow after `terraform show -json tfplan.binary > plan.json`.
+The Function URL accepts {repo, pr_number, head_sha, plan_json, baseline_usd}
+from the lightweight CI package. Optional S3 plan references remain supported
+for direct event invocations.
 
 Any unhandled exception anywhere in this function results in a "hold"
 decision and notification, never a silent auto-apply. That's the single
@@ -28,19 +28,10 @@ APPLY_ROLE_ARN = os.environ.get("GUARDIAN_APPLY_ROLE_ARN", "")
 
 
 def _fetch_plan_json(event_body: dict) -> str:
-    """Plan JSON can arrive inline (small plans) or as an S3 pointer
-    (larger plans, to stay under SQS's 256KB message size limit)."""
+    """Read the inline Terraform plan from a decision request."""
     if "plan_json" in event_body:
         return event_body["plan_json"]
-    if "plan_json_s3_uri" in event_body:
-        uri = event_body["plan_json_s3_uri"]
-        assert uri.startswith("s3://"), f"unexpected plan_json_s3_uri: {uri}"
-        _, _, rest = uri.partition("s3://")
-        bucket, _, key = rest.partition("/")
-        s3 = boto3.client("s3")
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return obj["Body"].read().decode()
-    raise ValueError("event body missing both 'plan_json' and 'plan_json_s3_uri'")
+    raise ValueError("request body missing 'plan_json'")
 
 
 def _trigger_apply(repo: str, pr_number: str) -> None:
@@ -120,9 +111,36 @@ def _process(event_body: dict) -> dict:
 
 def lambda_handler(event, context):
     """
-    SQS-triggered handler. Each SQS record's body is a JSON string matching
-    the shape described in _fetch_plan_json / _process.
+    Supports the synchronous Function URL and Lambda event invocation shapes.
     """
+    # Lambda Function URL / API Gateway request: synchronous decision API.
+    if "requestContext" in event and "http" in event.get("requestContext", {}):
+        try:
+            body = event.get("body") or "{}"
+            if event.get("isBase64Encoded"):
+                import base64
+                body = base64.b64decode(body).decode("utf-8")
+            payload = json.loads(body) if isinstance(body, str) else body
+            if event["requestContext"]["http"].get("method") == "GET":
+                return {"statusCode": 200, "headers": {"content-type": "application/json"},
+                        "body": json.dumps({"service": "infra-risk", "status": "ok"})}
+            if event["requestContext"]["http"].get("method") != "POST":
+                return {"statusCode": 405, "headers": {"content-type": "application/json"},
+                        "body": json.dumps({"error": "POST a Terraform plan to this endpoint"})}
+            decision = _process(payload)
+            if payload.get("model_advisory"):
+                decision["model_advisory"] = payload["model_advisory"]
+            return {"statusCode": 200, "headers": {"content-type": "application/json"},
+                    "body": json.dumps(decision)}
+        except Exception as e:  # noqa: BLE001: API errors also fail closed
+            failed = Decision(
+                action="hold",
+                reasoning=f"Decision API could not safely process this plan: {e}",
+                risk_flags=[RiskFlag("API_REQUEST_ERROR", str(e), "critical")],
+            )
+            return {"statusCode": 400, "headers": {"content-type": "application/json"},
+                    "body": json.dumps(failed.to_dict())}
+
     results = []
     for record in event.get("Records", [{"body": json.dumps(event)}]):
         try:

@@ -1,8 +1,4 @@
-# Role assumed by the watched repo's GitHub Actions workflow.
-#
-# This role is intentionally separate from the apply role. A pull request
-# workflow only needs to submit plan JSON to the guardian, so it can write to
-# the plan bucket and send one SQS message, but it cannot apply infrastructure.
+# Role assumed by the reusable Infra Risk client in a DevOps pipeline.
 
 locals {
   plan_submitter_subjects = [
@@ -36,7 +32,7 @@ data "aws_iam_policy_document" "plan_submitter_trust" {
 }
 
 resource "aws_iam_role" "plan_submitter" {
-  name               = "${var.project_name}-plan-submitter"
+  name               = "${var.project_name}-decision-client"
   assume_role_policy = data.aws_iam_policy_document.plan_submitter_trust.json
 
   tags = {
@@ -46,19 +42,10 @@ resource "aws_iam_role" "plan_submitter" {
 
 data "aws_iam_policy_document" "plan_submitter_permissions" {
   statement {
-    sid     = "UploadPlanJson"
+    sid     = "CallDecisionApi"
     effect  = "Allow"
-    actions = ["s3:PutObject"]
-    resources = [
-      "${aws_s3_bucket.plan_artifacts.arn}/plans/${var.github_org}/${var.github_repo}/*",
-    ]
-  }
-
-  statement {
-    sid       = "SendPlanPointer"
-    effect    = "Allow"
-    actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.plan_queue.arn]
+    actions = ["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"]
+    resources = [aws_lambda_function.guardian.arn]
   }
 }
 
