@@ -1,4 +1,4 @@
-# Infra Risk
+# Infra Sec
 
 Infra Risk reviews Terraform plans and returns a deterministic `auto_apply` or
 `hold` decision through an IAM-authenticated decision API. The consuming
