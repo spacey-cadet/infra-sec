@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: infra-risk
+Version: 0.1.0
+Summary: Lightweight CI client for the Infra Risk Terraform decision API
+Requires-Python: >=3.10
+License-File: LICENSE
+Provides-Extra: aws
+Requires-Dist: boto3>=1.34.0; extra == "aws"
+Provides-Extra: gliner
+Requires-Dist: boto3>=1.34.0; extra == "gliner"
+Requires-Dist: gliner2[local]; extra == "gliner"
+Provides-Extra: strands
+Requires-Dist: strands-agents>=1.0.0; extra == "strands"
+Dynamic: license-file
