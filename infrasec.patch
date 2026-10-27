@@ -1,0 +1,1771 @@
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+new file mode 100644
+index 0000000..efb8db6
+--- /dev/null
++++ b/.gitlab-ci.yml
+@@ -0,0 +1,123 @@
++# InfraSec: hands-off infrastructure security gate on GitLab.
++#
++# Every push runs the pipeline. If the plan is safe it deploys; if InfraSec holds it
++# the pipeline fails, and the Duo flow (flows/infrasec-autofix.yaml) explains why,
++# commits a fix, and re-runs, escalating to a human only if it cannot fix safely.
++#
++# Variables you can set on a run:
++#   DEMO_PLAN    path to a saved plan (demo/plans/*.json) to skip `terraform plan`
++#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   enable a real `terraform apply`
++
++stages: [plan, ci, decide, deploy]
++
++workflow:
++  rules:
++    - if: $CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule"
++
++variables:
++  TF_DIR: demo-target
++
++infrasec:plan:
++  stage: plan
++  image:
++    name: hashicorp/terraform:1.9
++    entrypoint: [""]
++  script:
++    - |
++      if [ -n "$DEMO_PLAN" ]; then
++        echo "Using saved plan $DEMO_PLAN"; cp "$DEMO_PLAN" plan.json
++      else
++        cd "$TF_DIR"
++        terraform init -input=false -backend=false
++        terraform plan -input=false -out=tfplan.binary
++        terraform show -json tfplan.binary > ../plan.json
++      fi
++  artifacts:
++    paths: [plan.json]
++
++# Conventional CI. These report their status instead of failing the job, so InfraSec can
++# say whether CI alone would have caught a problem (the report's "value added" line).
++ci:terraform:
++  stage: ci
++  image:
++    name: hashicorp/terraform:1.9
++    entrypoint: [""]
++  script:
++    - cd "$TF_DIR"
++    - set +e
++    - terraform fmt -check -recursive && terraform init -input=false -backend=false >/dev/null && terraform validate
++    - rc=$?
++    - if [ $rc -eq 0 ]; then echo "TF_CI=pass" > ../tf.env; else echo "TF_CI=fail" > ../tf.env; fi
++    - exit 0
++  artifacts:
++    reports:
++      dotenv: tf.env
++
++ci:tests:
++  stage: ci
++  image: python:3.12-slim
++  script:
++    - pip install --quiet pytest
++    - set +e
++    - python -m pytest tests/ -q
++    - rc=$?
++    - if [ $rc -eq 0 ]; then echo "TEST_CI=pass" > tests.env; else echo "TEST_CI=fail" > tests.env; fi
++    - exit 0
++  artifacts:
++    reports:
++      dotenv: tests.env
++
++# Suggests infrastructure code (least-privilege IAM, pinned OIDC trust, env, packages) by
++# reading this repo. Manual and non-blocking so it never interferes with the hands-off
++# gate. The `infrasec-suggest` Duo flow turns its output into a merge request.
++infrasec:suggest:
++  stage: ci
++  image: python:3.12-slim
++  when: manual
++  allow_failure: true
++  script:
++    - python scripts/infrasec_suggest.py --root . --repo "${SUGGEST_REPO:-$CI_PROJECT_PATH}"
++  artifacts:
++    when: always
++    paths: [suggested-infra/, infrasec-suggestions.md, infrasec-suggestions.json]
++
++# The gate. Fails the pipeline if InfraSec holds the change OR conventional CI failed.
++infrasec:decide:
++  stage: decide
++  image: python:3.12-slim
++  needs: ["infrasec:plan", "ci:terraform", "ci:tests"]
++  before_script:
++    - apt-get update -qq && apt-get install -y -qq git >/dev/null
++  script:
++    - export CI_STATUS=$([ "$TF_CI" = "pass" ] && [ "$TEST_CI" = "pass" ] && echo pass || echo fail)
++    - export INFRASEC_ATTEMPT=$(git log -n 20 --format=%B | grep -c '\[infrasec-autofix\]' || true)
++    - python scripts/infrasec_decide.py --plan plan.json --ci-status "$CI_STATUS" --attempt "$INFRASEC_ATTEMPT"
++  artifacts:
++    when: always
++    paths: [infrasec-decision.json, infrasec-report.md]
++
++# Hands-off deployment on the default branch once the gate passes.
++.deploy:
++  stage: deploy
++  needs: ["infrasec:decide"]
++  rules:
++    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
++  image:
++    name: hashicorp/terraform:1.9
++    entrypoint: [""]
++  script:
++    - |
++      if [ -n "$AWS_ACCESS_KEY_ID" ]; then
++        cd "$TF_DIR" && terraform init -input=false && terraform apply -input=false -auto-approve
++      else
++        echo "DEMO MODE: no AWS credentials set, so nothing is applied. Gate passed; this is where terraform apply runs."
++      fi
++
++deploy:staging:
++  extends: .deploy
++  environment: { name: staging }
++
++deploy:production:
++  extends: .deploy
++  needs: ["infrasec:decide", "deploy:staging"]
++  environment: { name: production }
+diff --git a/.infrasec/known_types.json b/.infrasec/known_types.json
+new file mode 100644
+index 0000000..29cb901
+--- /dev/null
++++ b/.infrasec/known_types.json
+@@ -0,0 +1 @@
++["aws_s3_bucket","aws_s3_bucket_public_access_block","aws_security_group","aws_security_group_rule","aws_vpc_security_group_ingress_rule"]
+diff --git a/README.md b/README.md
+index 88d743c..6a74471 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # Infra Sec
+ 
++> **InfraSec (hackathon build):** hands-off GitLab gate with a Duo auto-fix flow and an infra-code suggester. See [docs/INFRASEC.md](docs/INFRASEC.md).
++
+ Infra Risk reviews Terraform plans and returns a deterministic `auto_apply` or
+ `hold` decision through an IAM-authenticated decision API. The consuming
+ DevOps pipeline runs Terraform and calls the lightweight `infra-risk` Python
+diff --git a/agent/decision_engine.py b/agent/decision_engine.py
+index 2a35d88..5e20cc9 100644
+--- a/agent/decision_engine.py
++++ b/agent/decision_engine.py
+@@ -21,6 +21,7 @@ from typing import Optional
+ from .plan_parser import ParsedPlan, ResourceChange
+ from .oidc_diff import diff_trust_policy, OidcDiffResult
+ from .cost_estimate import CostEstimateResult
++from .security_checks import check_security_loosening
+ 
+ COST_THRESHOLD_USD = 2.0
+ COST_THRESHOLD_PCT = 0.40
+@@ -129,6 +130,28 @@ def evaluate(
+             highest_priority=True,
+         )
+ 
++    # Silent security loosening on non-IAM resources (open ingress, public S3,
++    # public DB, encryption off). These pass validate/plan/apply, so CI alone
++    # would ship them.
++    security_flags = check_security_loosening(parsed_plan.resource_changes)
++    if security_flags:
++        flags.extend(security_flags)
++        for rc in parsed_plan.touched_iam:
++            flags.append(RiskFlag(
++                "IAM_RESOURCE_TOUCHED",
++                f"{rc.address} ({rc.type}) is an IAM/policy resource and was {'/'.join(rc.actions)}.",
++                "warn",
++            ))
++        return Decision(
++            action="hold",
++            reasoning="Plan loosens a security control (" + ", ".join(sorted({f.code for f in security_flags})) +
++                      "). A change like this is valid Terraform and applies cleanly, so it is held for review.",
++            risk_flags=flags,
++            cost_delta_usd=cost_result.delta_usd,
++            confidence=0.97,
++            oidc_diff=oidc_result,
++        )
++
+     # IAM/policy resource types touched at all.
+     iam_touches = parsed_plan.touched_iam
+     if iam_touches:
+diff --git a/agent/fix_hints.py b/agent/fix_hints.py
+new file mode 100644
+index 0000000..e7b9fe3
+--- /dev/null
++++ b/agent/fix_hints.py
+@@ -0,0 +1,30 @@
++"""fix_hints
++
++Deterministic, per-finding remediation guidance. The InfraSec report embeds
++these so the explanation is reproducible; the Duo remediator agent turns them
++into an actual Terraform commit, but never decides *whether* to block.
++"""
++
++FIX_HINTS = {
++    "NETWORK_OPEN_TO_WORLD": "Replace 0.0.0.0/0 / ::/0 with the specific CIDR, VPN range or source security group that needs access. Keep 80/443 world-open only for a public load balancer.",
++    "S3_PUBLIC_ACCESS_LOOSENED": "Set all four aws_s3_bucket_public_access_block flags to true, remove public ACLs, and scope bucket policies to named principals or add a Condition.",
++    "DB_PUBLICLY_ACCESSIBLE": "Set publicly_accessible = false and reach the database through a private subnet, VPN or bastion.",
++    "ENCRYPTION_DISABLED": "Set encryption (storage_encrypted / encrypted) to true, with a KMS key if required.",
++    "OIDC_TRUST_WIDENED": "Pin the trust policy 'sub' claim to the exact repo and branch (repo:ORG/REPO:ref:refs/heads/main), use StringEquals, and keep aud = sts.amazonaws.com.",
++    "OIDC_TRUST_CHANGED": "Confirm the changed trust condition is still pinned to one repo and ref.",
++    "IAM_RESOURCE_TOUCHED": "IAM changes always need a human reviewer. Confirm least privilege (no wildcard actions or resources).",
++    "NEW_RESOURCE_TYPE": "First use of this resource type in this repo: have a human confirm it is intended, then add it to .infrasec/known_types.json.",
++    "COST_THRESHOLD_EXCEEDED": "Reduce size/count, or have a human approve the cost increase.",
++    "UNKNOWN_ACTION": "The plan contains an action InfraSec does not recognise. Re-run with a supported Terraform version.",
++    "PARSE_ERROR": "Re-generate the plan with `terraform show -json tfplan.binary > plan.json`.",
++}
++
++# Findings an automated agent may fix by itself because the safe fix is a pure
++# tightening. Everything else is escalated to a human.
++AUTO_FIXABLE = {
++    "NETWORK_OPEN_TO_WORLD",
++    "S3_PUBLIC_ACCESS_LOOSENED",
++    "DB_PUBLICLY_ACCESSIBLE",
++    "ENCRYPTION_DISABLED",
++    "OIDC_TRUST_WIDENED",
++}
+diff --git a/agent/security_checks.py b/agent/security_checks.py
+new file mode 100644
+index 0000000..fc5b80a
+--- /dev/null
++++ b/agent/security_checks.py
+@@ -0,0 +1,148 @@
++"""security_checks
++
++Deterministic detectors for *silent security loosening* on resources that are
++NOT IAM/OIDC (those are handled by oidc_diff + the IAM gate). These are the
++changes that pass `terraform validate`, `plan` and `apply` and that a normal CI
++pipeline will happily ship:
++
++  NETWORK_OPEN_TO_WORLD       ingress newly open to 0.0.0.0/0 or ::/0
++  S3_PUBLIC_ACCESS_LOOSENED   public-access-block flag off, public ACL, or
++                              bucket policy granting Principal "*"
++  DB_PUBLICLY_ACCESSIBLE      RDS instance made publicly_accessible
++  ENCRYPTION_DISABLED         storage/volume encryption explicitly off
++
++Every check compares `after` against `before` so a pre-existing setting that
++did not change is not re-flagged. A resource being deleted is never flagged
++(removing something cannot loosen it). Any returned flag means "hold".
++"""
++from __future__ import annotations
++
++import json
++from typing import Any, Iterable, Optional
++
++from .plan_parser import ResourceChange
++
++WORLD_V4 = "0.0.0.0/0"
++WORLD_V6 = "::/0"
++WEB_PORTS = {80, 443}
++PUBLIC_ACLS = {"public-read", "public-read-write", "authenticated-read"}
++PAB_FLAGS = ("block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets")
++
++
++def _flag(code: str, message: str, severity: str):
++    # Imported lazily to avoid a circular import with decision_engine.
++    from .decision_engine import RiskFlag
++    return RiskFlag(code, message, severity)
++
++
++def _as_list(value: Any) -> list:
++    if value is None:
++        return []
++    return value if isinstance(value, list) else [value]
++
++
++def _world_open(rc_type: str, doc: Optional[dict]) -> set[tuple]:
++    """Return {(from_port, to_port, protocol)} that are open to the world."""
++    if not doc:
++        return set()
++    out: set[tuple] = set()
++
++    def add(block: dict, v4: Iterable, v6: Iterable, proto_key: str = "protocol"):
++        cidrs = set(_as_list(v4)) | set(_as_list(v6))
++        if WORLD_V4 in cidrs or WORLD_V6 in cidrs:
++            out.add((block.get("from_port"), block.get("to_port"), str(block.get(proto_key))))
++
++    if rc_type == "aws_security_group":
++        for block in _as_list(doc.get("ingress")):
++            if isinstance(block, dict):
++                add(block, block.get("cidr_blocks"), block.get("ipv6_cidr_blocks"))
++    elif rc_type == "aws_security_group_rule":
++        if doc.get("type") == "ingress":
++            add(doc, doc.get("cidr_blocks"), doc.get("ipv6_cidr_blocks"))
++    elif rc_type == "aws_vpc_security_group_ingress_rule":
++        add(doc, doc.get("cidr_ipv4"), doc.get("cidr_ipv6"), proto_key="ip_protocol")
++    return out
++
++
++def _fmt_port(rule: tuple) -> str:
++    frm, to, proto = rule
++    if str(proto) in ("-1", "all"):
++        return "ALL traffic"
++    return f"{proto}/{frm}" if frm == to else f"{proto}/{frm}-{to}"
++
++
++def _check_network(rc: ResourceChange):
++    newly = _world_open(rc.type, rc.after) - _world_open(rc.type, rc.before)
++    flags = []
++    for rule in sorted(newly, key=str):
++        frm, to = rule[0], rule[1]
++        web_only = isinstance(frm, int) and isinstance(to, int) and frm == to and frm in WEB_PORTS
++        flags.append(_flag(
++            "NETWORK_OPEN_TO_WORLD",
++            f"{rc.address}: ingress {_fmt_port(rule)} is newly open to the internet (0.0.0.0/0 or ::/0).",
++            "warn" if web_only else "critical",
++        ))
++    return flags
++
++
++def _policy_is_public(policy: Any) -> bool:
++    try:
++        doc = json.loads(policy) if isinstance(policy, str) else policy
++    except (ValueError, TypeError):
++        return False
++    if not isinstance(doc, dict):
++        return False
++    for stmt in _as_list(doc.get("Statement")):
++        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow" or stmt.get("Condition"):
++            continue
++        principal = stmt.get("Principal")
++        if principal == "*" or (isinstance(principal, dict) and "*" in _as_list(principal.get("AWS"))):
++            return True
++    return False
++
++
++def _check_s3(rc: ResourceChange):
++    after, before = rc.after or {}, rc.before or {}
++    flags = []
++    if rc.type == "aws_s3_bucket_public_access_block":
++        off = [k for k in PAB_FLAGS if after.get(k) is False and before.get(k) is not False]
++        if off:
++            flags.append(_flag("S3_PUBLIC_ACCESS_LOOSENED",
++                               f"{rc.address}: public access protection turned off ({', '.join(off)}).", "critical"))
++    elif rc.type in ("aws_s3_bucket_acl", "aws_s3_bucket"):
++        acl = after.get("acl")
++        if acl in PUBLIC_ACLS and before.get("acl") != acl:
++            flags.append(_flag("S3_PUBLIC_ACCESS_LOOSENED",
++                               f"{rc.address}: ACL set to '{acl}'.", "critical"))
++    elif rc.type == "aws_s3_bucket_policy":
++        if _policy_is_public(after.get("policy")) and not _policy_is_public(before.get("policy")):
++            flags.append(_flag("S3_PUBLIC_ACCESS_LOOSENED",
++                               f"{rc.address}: bucket policy grants access to Principal \"*\" with no condition.", "critical"))
++    return flags
++
++
++def _check_db(rc: ResourceChange):
++    if rc.type in ("aws_db_instance", "aws_rds_cluster_instance"):
++        if (rc.after or {}).get("publicly_accessible") is True and (rc.before or {}).get("publicly_accessible") is not True:
++            return [_flag("DB_PUBLICLY_ACCESSIBLE",
++                          f"{rc.address}: database is now publicly accessible.", "critical")]
++    return []
++
++
++def _check_encryption(rc: ResourceChange):
++    key = {"aws_db_instance": "storage_encrypted", "aws_ebs_volume": "encrypted",
++           "aws_rds_cluster": "storage_encrypted"}.get(rc.type)
++    if key and (rc.after or {}).get(key) is False and (rc.before or {}).get(key) is not False:
++        return [_flag("ENCRYPTION_DISABLED", f"{rc.address}: {key} is false.", "critical")]
++    return []
++
++
++def check_security_loosening(changes: list[ResourceChange]) -> list:
++    """Run all detectors. Returns a list of RiskFlag; empty means nothing found."""
++    flags = []
++    for rc in changes:
++        if rc.is_delete or rc.is_noop or rc.after is None:
++            continue
++        for check in (_check_network, _check_s3, _check_db, _check_encryption):
++            flags.extend(check(rc))
++    return flags
+diff --git a/agent/suggest.py b/agent/suggest.py
+new file mode 100644
+index 0000000..eb327ce
+--- /dev/null
++++ b/agent/suggest.py
+@@ -0,0 +1,418 @@
++"""suggest
++
++Reads a repository and suggests the infrastructure code it needs: least-privilege IAM
++actions derived from real SDK calls, a CI OIDC role pinned to this repo, and
++environment/package fixes. Deterministic: nothing here calls an LLM. The Duo agent
++reviews and refines the output, and the InfraSec gate reviews what gets merged.
++
++Design rules:
++  * Never emit a wildcard ("*") resource. Resources are Terraform variables the user
++    must fill in, so a missing value fails loudly instead of granting everything.
++  * Every suggestion carries evidence (file:line) so a reviewer can check it.
++  * Anything derived by naming convention (not on the verified list) is marked
++    confidence "check".
++"""
++from __future__ import annotations
++
++import ast
++import json
++import re
++import subprocess
++import tomllib
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Optional
++
++SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".terraform",
++             "suggested-infra", "tests", "demo-target", "dist", "build", ".tox"}
++
++KNOWN_SERVICES = {"s3", "dynamodb", "sqs", "sns", "secretsmanager", "lambda", "kms", "ssm", "logs"}
++IAM_PREFIX = {"bedrock-runtime": "bedrock", "secrets-manager": "secretsmanager",
++              "stepfunctions": "states", "sfn": "states", "cloudwatch-logs": "logs"}
++ACTION_OVERRIDES = {
++    ("s3", "list_objects_v2"): "ListBucket", ("s3", "list_objects"): "ListBucket",
++    ("s3", "upload_file"): "PutObject", ("s3", "upload_fileobj"): "PutObject",
++    ("s3", "download_file"): "GetObject", ("s3", "download_fileobj"): "GetObject",
++    ("s3", "head_object"): "GetObject", ("lambda", "invoke"): "InvokeFunction",
++}
++NON_API = {"get_paginator", "can_paginate", "get_waiter", "generate_presigned_url", "close",
++           "meta", "exceptions", "Table", "Bucket", "Queue", "Topic", "Object"}
++RESOURCE_CTORS = {"Table", "Bucket", "Queue", "Topic", "Object"}
++SECRET_NAME = re.compile(r"(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL)", re.I)
++AMBIENT_ENV = re.compile(r"^(AWS_|LAMBDA_|_HANDLER|PATH$|HOME$|PWD$|HOSTNAME$|LANG$|TZ$)")
++
++
++@dataclass
++class Usage:
++    service: str
++    action: str          # IAM action without prefix, e.g. GetObject
++    file: str
++    line: int
++    confidence: str      # "high" | "check"
++
++    @property
++    def iam(self) -> str:
++        return f"{IAM_PREFIX.get(self.service, self.service)}:{self.action}"
++
++
++@dataclass
++class Finding:
++    code: str
++    severity: str        # "info" | "warn" | "critical"
++    message: str
++    evidence: list[str] = field(default_factory=list)
++    fix: str = ""
++
++
++@dataclass
++class Suggestion:
++    files: dict[str, str] = field(default_factory=dict)
++    findings: list[Finding] = field(default_factory=list)
++    usages: list[Usage] = field(default_factory=list)
++    env_vars: dict[str, list[str]] = field(default_factory=dict)
++    repo: Optional[str] = None
++
++
++def _pascal(snake: str) -> str:
++    return "".join(p.capitalize() for p in snake.split("_"))
++
++
++def _walk(root: Path):
++    for p in sorted(root.rglob("*")):
++        if p.is_file() and not (set(p.relative_to(root).parts[:-1]) & SKIP_DIRS):
++            yield p
++
++
++def _read(p: Path) -> str:
++    try:
++        return p.read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        return ""
++
++
++# ------------------------------------------------------------------ python SDK usage
++def _name(node) -> Optional[str]:
++    if isinstance(node, ast.Name):
++        return node.id
++    if isinstance(node, ast.Attribute):
++        return node.attr
++    return None
++
++
++def _service_of(call: ast.Call, tracked: dict[str, str]) -> Optional[str]:
++    f = call.func
++    if not isinstance(f, ast.Attribute):
++        return None
++    if f.attr in ("client", "resource") and call.args and isinstance(call.args[0], ast.Constant) \
++            and isinstance(call.args[0].value, str):
++        return call.args[0].value
++    if f.attr in RESOURCE_CTORS:
++        recv = _name(f.value)
++        if recv in tracked:
++            return tracked[recv]
++        if isinstance(f.value, ast.Call):
++            return _service_of(f.value, tracked)
++    return None
++
++
++def _scan_python(path: Path, rel: str, usages: list, envs: dict):
++    try:
++        tree = ast.parse(_read(path))
++    except SyntaxError:
++        return
++    tracked: dict[str, str] = {}
++    for _ in range(2):  # second pass resolves variables derived from other variables
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
++                svc = _service_of(node.value, tracked)
++                if svc:
++                    for t in node.targets:
++                        n = _name(t)
++                        if n:
++                            tracked[n] = svc
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
++            method, recv = node.func.attr, node.func.value
++            svc = tracked.get(_name(recv) or "") or (_service_of(recv, tracked) if isinstance(recv, ast.Call) else None)
++            if svc and method not in NON_API - {"get_paginator"}:
++                if method == "get_paginator":
++                    if not (node.args and isinstance(node.args[0], ast.Constant)):
++                        continue
++                    method = node.args[0].value
++                action = ACTION_OVERRIDES.get((svc, method)) or _pascal(method)
++                conf = "high" if svc in KNOWN_SERVICES else "check"
++                usages.append(Usage(svc, action, rel, node.lineno, conf))
++        # environment variables
++        name = None
++        if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ" \
++                and isinstance(node.slice, ast.Constant):
++            name = node.slice.value
++        elif isinstance(node, ast.Call) and ast.unparse(node.func) in ("os.environ.get", "os.getenv") \
++                and node.args and isinstance(node.args[0], ast.Constant):
++            name = node.args[0].value
++        if isinstance(name, str):
++            envs.setdefault(name, []).append(f"{rel}:{node.lineno}")
++
++
++# ------------------------------------------------------------------ javascript SDK usage
++JS_IMPORT = re.compile(r"""(?:import\s*\{([^}]*)\}\s*from|const\s*\{([^}]*)\}\s*=\s*require\()\s*["']@aws-sdk/client-([a-z0-9-]+)["']""")
++JS_ENV = re.compile(r"process\.env\.([A-Z0-9_]+)")
++
++
++def _scan_js(path: Path, rel: str, usages: list, envs: dict):
++    text = _read(path)
++    for m in JS_IMPORT.finditer(text):
++        svc = m.group(3)
++        line = text.count("\n", 0, m.start()) + 1
++        for raw in (m.group(1) or m.group(2) or "").split(","):
++            name = raw.strip().split(" as ")[0].strip()
++            if name.endswith("Command") and len(name) > 7:
++                usages.append(Usage(svc, name[:-7], rel, line, "high" if svc in KNOWN_SERVICES else "check"))
++    for m in JS_ENV.finditer(text):
++        envs.setdefault(m.group(1), []).append(f"{rel}:{text.count(chr(10), 0, m.start()) + 1}")
++
++
++# ------------------------------------------------------------------ CI / OIDC
++def _guess_repo(root: Path) -> Optional[str]:
++    try:
++        url = subprocess.run(["git", "-C", str(root), "config", "--get", "remote.origin.url"],
++                             capture_output=True, text=True, timeout=5).stdout.strip()
++    except (OSError, subprocess.SubprocessError):
++        return None
++    m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", url)
++    return m.group(1) if m else None
++
++
++def _scan_ci(root: Path, findings: list) -> dict:
++    ci = {"github": False, "gitlab": False}
++    for p in _walk(root):
++        rel = str(p.relative_to(root))
++        if rel.startswith(".github/workflows/") and p.suffix in (".yml", ".yaml"):
++            text = _read(p)
++            if "role-to-assume" in text:
++                ci["github"] = True
++                if not re.search(r"id-token:\s*write", text):
++                    findings.append(Finding(
++                        "OIDC_MISSING_ID_TOKEN_PERMISSION", "critical",
++                        f"{rel} assumes an AWS role via OIDC but never grants `id-token: write`. "
++                        "The job cannot request a token, so the role assumption fails with a "
++                        "misleading credentials error.",
++                        [rel], "Add `permissions:\\n  id-token: write\\n  contents: read` to the workflow or job."))
++        elif rel == ".gitlab-ci.yml":
++            text = _read(p)
++            if re.search(r"^\s*id_tokens:", text, re.M):
++                ci["gitlab"] = True
++    return ci
++
++
++# ------------------------------------------------------------------ packages
++def _python_deps(root: Path) -> Optional[set[str]]:
++    deps: set[str] = set()
++    found = False
++    norm = lambda s: re.split(r"[<>=!~\[; ]", s.strip(), maxsplit=1)[0].lower().replace("_", "-")
++    for p in _walk(root):
++        if re.fullmatch(r"requirements[\w.\-]*\.txt", p.name):
++            found = True
++            deps |= {norm(l) for l in _read(p).splitlines() if l.strip() and not l.lstrip().startswith(("#", "-"))}
++        elif p.name == "pyproject.toml":
++            found = True
++            try:
++                data = tomllib.loads(_read(p)).get("project", {})
++            except tomllib.TOMLDecodeError:
++                continue
++            for d in data.get("dependencies", []):
++                deps.add(norm(d))
++            for group in data.get("optional-dependencies", {}).values():
++                deps |= {norm(d) for d in group}
++    return deps if found else None
++
++
++def _js_deps(root: Path) -> Optional[set[str]]:
++    pj = root / "package.json"
++    if not pj.exists():
++        return None
++    try:
++        data = json.loads(_read(pj))
++    except ValueError:
++        return set()
++    return set(data.get("dependencies", {})) | set(data.get("devDependencies", {}))
++
++
++# ------------------------------------------------------------------ terraform generation
++SCOPES = {  # service -> (variable, description)
++    "s3": ("s3_bucket_arn", "ARN of the S3 bucket the app uses."),
++    "dynamodb": ("dynamodb_table_arn", "ARN of the DynamoDB table the app uses."),
++    "sqs": ("sqs_queue_arn", "ARN of the SQS queue the app uses."),
++    "sns": ("sns_topic_arn", "ARN of the SNS topic the app uses."),
++    "secretsmanager": ("secret_arn", "ARN of the Secrets Manager secret the app reads."),
++    "lambda": ("lambda_function_arn", "ARN of the Lambda function the app invokes."),
++    "kms": ("kms_key_arn", "ARN of the KMS key the app uses."),
++    "ssm": ("ssm_parameter_arn", "ARN of the SSM parameter the app reads."),
++}
++
++
++def _scope(u: Usage):
++    var, desc = SCOPES.get(u.service, (u.service.replace("-", "_") + "_resource_arn",
++                                       f"ARN of the {u.service} resource the app uses."))
++    if u.service == "s3" and u.action != "ListBucket":
++        return "S3Object", f'"${{var.{var}}}/*"', var, desc
++    return (u.service.replace("-", " ").title().replace(" ", "") + ("Bucket" if u.service == "s3" else ""),
++            f"var.{var}", var, desc)
++
++
++def _hcl_var(name: str, desc: str, extra: str = "") -> str:
++    return f'variable "{name}" {{\n  description = "{desc}"\n  type        = string\n{extra}}}\n'
++
++
++def _gen_iam(usages: list[Usage]) -> dict[str, str]:
++    groups: dict[tuple, set] = {}
++    vars_: dict[str, str] = {}
++    for u in usages:
++        sid, res, var, desc = _scope(u)
++        groups.setdefault((sid, res), set()).add(u.iam)
++        vars_[var] = desc
++    stmts = ""
++    for (sid, res), actions in sorted(groups.items()):
++        acts = ", ".join(f'"{a}"' for a in sorted(actions))
++        stmts += f'  statement {{\n    sid       = "{sid}"\n    actions   = [{acts}]\n    resources = [{res}]\n  }}\n\n'
++    iam = (
++        "# Generated by InfraSec from the SDK calls in this repo. REVIEW before applying:\n"
++        "# IAM changes always need a human. Resources are variables on purpose (no wildcards).\n\n"
++        'data "aws_iam_policy_document" "app" {\n' + stmts.rstrip("\n") + "\n}\n\n"
++        'resource "aws_iam_role" "app" {\n  name = "${var.name_prefix}-app"\n\n'
++        '  assume_role_policy = jsonencode({\n    Version = "2012-10-17"\n    Statement = [{\n'
++        '      Effect    = "Allow"\n      Principal = { Service = var.app_service_principal }\n'
++        '      Action    = "sts:AssumeRole"\n    }]\n  })\n}\n\n'
++        'resource "aws_iam_role_policy" "app" {\n  name   = "least-privilege"\n  role   = aws_iam_role.app.id\n'
++        "  policy = data.aws_iam_policy_document.app.json\n}\n"
++    )
++    variables = (
++        _hcl_var("name_prefix", "Prefix for created resource names.")
++        + "\n" + _hcl_var("app_service_principal", "Service that runs the app (lambda.amazonaws.com, ecs-tasks.amazonaws.com, ...).",
++                          '  default     = "lambda.amazonaws.com"\n')
++    )
++    for name, desc in sorted(vars_.items()):
++        variables += "\n" + _hcl_var(name, desc)
++    return {"iam.tf": iam, "variables.tf": variables}
++
++
++def _gen_oidc(ci: dict, repo: Optional[str]) -> str:
++    slug = repo or "ORG/REPO"
++    out = ("# CI deploy role, pinned to ONE repo and branch. Fixes the common OIDC trial-and-error:\n"
++           "# wrong/missing `sub`, wildcard trust, and over-broad roles.\n"
++           "# Attach only the permissions your deploy actually needs (never AdministratorAccess).\n\n")
++    if ci["github"]:
++        out += (
++            'data "aws_iam_openid_connect_provider" "github" {\n  url = "https://token.actions.githubusercontent.com"\n}\n\n'
++            'resource "aws_iam_role" "ci_deploy" {\n  name = "${var.name_prefix}-ci-deploy"\n\n'
++            '  assume_role_policy = jsonencode({\n    Version = "2012-10-17"\n    Statement = [{\n'
++            '      Effect    = "Allow"\n      Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }\n'
++            '      Action    = "sts:AssumeRoleWithWebIdentity"\n      Condition = {\n        StringEquals = {\n'
++            '          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"\n'
++            f'          "token.actions.githubusercontent.com:sub" = "repo:{slug}:ref:refs/heads/main"\n'
++            "        }\n      }\n    }]\n  })\n}\n")
++    if ci["gitlab"]:
++        out += (
++            '\ndata "aws_iam_openid_connect_provider" "gitlab" {\n  url = "https://gitlab.com"\n}\n\n'
++            'resource "aws_iam_role" "ci_deploy_gitlab" {\n  name = "${var.name_prefix}-ci-deploy-gitlab"\n\n'
++            '  assume_role_policy = jsonencode({\n    Version = "2012-10-17"\n    Statement = [{\n'
++            '      Effect    = "Allow"\n      Principal = { Federated = data.aws_iam_openid_connect_provider.gitlab.arn }\n'
++            '      Action    = "sts:AssumeRoleWithWebIdentity"\n      Condition = {\n        StringEquals = {\n'
++            '          "gitlab.com:aud" = "sts.amazonaws.com"\n'
++            f'          "gitlab.com:sub" = "project_path:{slug}:ref_type:branch:ref:main"\n'
++            "        }\n      }\n    }]\n  })\n}\n")
++    return out
++
++
++def _gen_env(envs: dict[str, list[str]]) -> str:
++    plain = sorted(n for n in envs if not AMBIENT_ENV.match(n) and not SECRET_NAME.search(n))
++    secret = sorted(n for n in envs if not AMBIENT_ENV.match(n) and SECRET_NAME.search(n))
++    body = "# Environment the application reads. Secrets are referenced by ARN, never plain env vars.\n\n"
++    body += 'variable "app_env" {\n  description = "Non-secret environment variables."\n  type        = map(string)\n  default = {\n'
++    body += "".join(f'    {n} = ""\n' for n in plain) + "  }\n}\n"
++    if secret:
++        body += '\nvariable "app_secret_arns" {\n  description = "Secrets Manager ARNs for secret-looking variables."\n  type        = map(string)\n  default = {\n'
++        body += "".join(f'    {n} = ""\n' for n in secret) + "  }\n}\n"
++    return body
++
++
++# ------------------------------------------------------------------ entry point
++def suggest(root: str | Path, repo: Optional[str] = None) -> Suggestion:
++    root = Path(root)
++    s = Suggestion(repo=repo or _guess_repo(root))
++    for p in _walk(root):
++        rel = str(p.relative_to(root))
++        if p.suffix == ".py":
++            _scan_python(p, rel, s.usages, s.env_vars)
++        elif p.suffix in (".js", ".mjs", ".ts", ".tsx"):
++            _scan_js(p, rel, s.usages, s.env_vars)
++
++    ci = _scan_ci(root, s.findings)
++
++    # packages
++    py_uses = {u.file for u in s.usages if u.file.endswith(".py")}
++    if py_uses:
++        deps = _python_deps(root)
++        if deps is None or "boto3" not in deps:
++            s.findings.append(Finding(
++                "PACKAGE_MISSING", "warn",
++                "Code calls AWS through boto3 but boto3 is not declared in requirements/pyproject."
++                if deps is not None else "Code calls AWS through boto3 but no requirements.txt or pyproject.toml exists.",
++                sorted(py_uses)[:5], "Add `boto3` (pinned, e.g. boto3==1.35.*) to requirements.txt."))
++    js_uses = {u.file for u in s.usages if not u.file.endswith(".py")}
++    if js_uses:
++        jd = _js_deps(root)
++        for svc in sorted({u.service for u in s.usages if not u.file.endswith(".py")}):
++            if jd is None or f"@aws-sdk/client-{svc}" not in jd:
++                s.findings.append(Finding("PACKAGE_MISSING", "warn",
++                                          f"Code imports @aws-sdk/client-{svc} but package.json does not declare it.",
++                                          sorted(js_uses)[:5], f"npm install @aws-sdk/client-{svc}"))
++
++    # env / secrets
++    for name, ev in sorted(s.env_vars.items()):
++        if SECRET_NAME.search(name) and not AMBIENT_ENV.match(name):
++            s.findings.append(Finding(
++                "SECRET_IN_ENV", "warn",
++                f"`{name}` looks like a secret and is read from an environment variable.", ev[:3],
++                "Store it in Secrets Manager or SSM SecureString and inject it at runtime by ARN; don't put it in Terraform or plain env."))
++
++    # IAM
++    if s.usages:
++        s.files.update(_gen_iam(s.usages))
++        actions = {u.iam for u in s.usages}
++        s.findings.append(Finding(
++            "IAM_LEAST_PRIVILEGE", "info",
++            f"Derived {len(actions)} IAM action(s) from SDK calls: {', '.join(sorted(actions))}.",
++            [f"{u.file}:{u.line}" for u in s.usages[:5]],
++            "Review suggested-infra/iam.tf and set the resource ARN variables."))
++        if any(u.confidence == "check" for u in s.usages):
++            s.findings.append(Finding(
++                "IAM_ACTION_UNVERIFIED", "warn",
++                "Some actions were derived from method names and are not on the verified list: " +
++                ", ".join(sorted({u.iam for u in s.usages if u.confidence == 'check'})) + ".",
++                [], "Check each against the AWS service authorization reference."))
++
++    # OIDC
++    if ci["github"] or ci["gitlab"]:
++        s.files["oidc.tf"] = _gen_oidc(ci, s.repo)
++        if not s.repo:
++            s.findings.append(Finding("REPO_UNKNOWN", "warn",
++                                      "Could not determine ORG/REPO, so the OIDC trust uses the placeholder ORG/REPO.",
++                                      [], "Re-run with --repo ORG/REPO."))
++        s.files.setdefault("variables.tf", _hcl_var("name_prefix", "Prefix for created resource names."))
++    if any(n for n in s.env_vars if not AMBIENT_ENV.match(n)):
++        s.files["app_env.tf"] = _gen_env(s.env_vars)
++    return s
++
++
++def to_markdown(s: Suggestion) -> str:
++    lines = ["## InfraSec suggestions", ""]
++    if not s.findings and not s.files:
++        return "## InfraSec suggestions\n\nNo infrastructure needs detected in this repo.\n"
++    lines += ["| Severity | Code | Finding | Evidence | Fix |", "|---|---|---|---|---|"]
++    for f in sorted(s.findings, key=lambda f: {"critical": 0, "warn": 1, "info": 2}[f.severity]):
++        lines.append(f"| {f.severity} | `{f.code}` | {f.message} | {', '.join(f.evidence)} | {f.fix} |")
++    if s.files:
++        lines += ["", "Generated files (in `suggested-infra/`): " + ", ".join(f"`{n}`" for n in sorted(s.files)),
++                  "", "IAM and trust changes always need human review before they are applied."]
++    return "\n".join(lines) + "\n"
+diff --git a/demo-target/main.tf b/demo-target/main.tf
+new file mode 100644
+index 0000000..b5e37b6
+--- /dev/null
++++ b/demo-target/main.tf
+@@ -0,0 +1,46 @@
++# The infrastructure InfraSec guards in the demo. Edit this file (for example, open
++# the security group to 0.0.0.0/0) and push: the pipeline plans it, InfraSec holds it,
++# and the Duo agent commits the fix.
++#
++# The provider is configured to plan offline (no AWS account needed). Plans are
++# create-only, which is enough because InfraSec inspects the planned "after" state.
++terraform {
++  required_version = ">= 1.5"
++  required_providers {
++    aws = { source = "hashicorp/aws", version = "~> 5.0" }
++  }
++}
++
++provider "aws" {
++  region                      = "us-east-1"
++  access_key                  = "offline"
++  secret_key                  = "offline"
++  skip_credentials_validation = true
++  skip_requesting_account_id  = true
++  skip_metadata_api_check     = true
++  skip_region_validation      = true
++}
++
++resource "aws_s3_bucket" "data" {
++  bucket = "infrasec-demo-data"
++}
++
++resource "aws_s3_bucket_public_access_block" "data" {
++  bucket                  = aws_s3_bucket.data.id
++  block_public_acls       = true
++  block_public_policy     = true
++  ignore_public_acls      = true
++  restrict_public_buckets = true
++}
++
++resource "aws_security_group" "app" {
++  name = "app"
++
++  ingress {
++    description = "SSH from the internal network only"
++    from_port   = 22
++    to_port     = 22
++    protocol    = "tcp"
++    cidr_blocks = ["10.0.0.0/8"]
++  }
++}
+diff --git a/demo/plans/s3_public.json b/demo/plans/s3_public.json
+new file mode 100644
+index 0000000..92217a5
+--- /dev/null
++++ b/demo/plans/s3_public.json
+@@ -0,0 +1,63 @@
++{
++  "format_version": "1.2",
++  "resource_changes": [
++    {
++      "address": "aws_s3_bucket.data",
++      "type": "aws_s3_bucket",
++      "name": "data",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "bucket": "infrasec-demo-data"
++        }
++      }
++    },
++    {
++      "address": "aws_s3_bucket_public_access_block.data",
++      "type": "aws_s3_bucket_public_access_block",
++      "name": "data",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "block_public_acls": true,
++          "block_public_policy": false,
++          "ignore_public_acls": true,
++          "restrict_public_buckets": true
++        }
++      }
++    },
++    {
++      "address": "aws_security_group.app",
++      "type": "aws_security_group",
++      "name": "app",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "name": "app",
++          "ingress": [
++            {
++              "cidr_blocks": [
++                "10.0.0.0/8"
++              ],
++              "from_port": 22,
++              "to_port": 22,
++              "protocol": "tcp"
++            }
++          ]
++        }
++      }
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/demo/plans/safe.json b/demo/plans/safe.json
+new file mode 100644
+index 0000000..6c7c8e9
+--- /dev/null
++++ b/demo/plans/safe.json
+@@ -0,0 +1,63 @@
++{
++  "format_version": "1.2",
++  "resource_changes": [
++    {
++      "address": "aws_s3_bucket.data",
++      "type": "aws_s3_bucket",
++      "name": "data",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "bucket": "infrasec-demo-data"
++        }
++      }
++    },
++    {
++      "address": "aws_s3_bucket_public_access_block.data",
++      "type": "aws_s3_bucket_public_access_block",
++      "name": "data",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "block_public_acls": true,
++          "block_public_policy": true,
++          "ignore_public_acls": true,
++          "restrict_public_buckets": true
++        }
++      }
++    },
++    {
++      "address": "aws_security_group.app",
++      "type": "aws_security_group",
++      "name": "app",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "name": "app",
++          "ingress": [
++            {
++              "cidr_blocks": [
++                "10.0.0.0/8"
++              ],
++              "from_port": 22,
++              "to_port": 22,
++              "protocol": "tcp"
++            }
++          ]
++        }
++      }
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/demo/plans/ssh_open.json b/demo/plans/ssh_open.json
+new file mode 100644
+index 0000000..43c0c77
+--- /dev/null
++++ b/demo/plans/ssh_open.json
+@@ -0,0 +1,63 @@
++{
++  "format_version": "1.2",
++  "resource_changes": [
++    {
++      "address": "aws_s3_bucket.data",
++      "type": "aws_s3_bucket",
++      "name": "data",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "bucket": "infrasec-demo-data"
++        }
++      }
++    },
++    {
++      "address": "aws_s3_bucket_public_access_block.data",
++      "type": "aws_s3_bucket_public_access_block",
++      "name": "data",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "block_public_acls": true,
++          "block_public_policy": true,
++          "ignore_public_acls": true,
++          "restrict_public_buckets": true
++        }
++      }
++    },
++    {
++      "address": "aws_security_group.app",
++      "type": "aws_security_group",
++      "name": "app",
++      "provider_name": "registry.terraform.io/hashicorp/aws",
++      "change": {
++        "actions": [
++          "create"
++        ],
++        "before": null,
++        "after": {
++          "name": "app",
++          "ingress": [
++            {
++              "cidr_blocks": [
++                "0.0.0.0/0"
++              ],
++              "from_port": 22,
++              "to_port": 22,
++              "protocol": "tcp"
++            }
++          ]
++        }
++      }
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/docs/INFRASEC.md b/docs/INFRASEC.md
+new file mode 100644
+index 0000000..d74377e
+--- /dev/null
++++ b/docs/INFRASEC.md
+@@ -0,0 +1,106 @@
++# InfraSec: hands-off infrastructure security gate on GitLab
++
++Built on Infra Risk Guardian (deterministic decision engine) for the GitLab Transcend
++hackathon, **Path B (Bring Your Own)**, **Hands-off** autonomy.
++
++## The loop
++
++```
++push ──> pipeline ──> plan ──> conventional CI (fmt / validate / tests)
++                                   │
++                                   v
++                          InfraSec gate (deterministic)
++                     ┌─────────────┴──────────────┐
++                  PASS                          HELD (pipeline fails)
++                     │                              │
++        deploy staging -> production      Duo flow fires on "pipeline failed"
++        (default branch, no human)         1. explains why it did not pass
++                                           2. commits the minimal fix [infrasec-autofix]
++                                           3. posts /merge (merges only if the re-run passes)
++                                           4. after 2 attempts, or for non-fixable findings,
++                                              labels infrasec::needs-human and stops
++```
++
++Nobody approves anything on the happy path or the fix path. A human is pulled in only
++when the agent cannot fix safely (IAM changes, new resource types, cost, parse errors).
++
++## Why the agent is not redundant with CI
++
++`infrasec-report.md` records what conventional CI said and states the value added:
++
++| CI said | InfraSec said | Value added |
++|---|---|---|
++| pass | held | **gate**: CI alone would have shipped it (valid Terraform that loosens security) |
++| fail | held | **diagnosis**: CI was failing anyway; InfraSec only explains and proposes the fix |
++| pass | pass | none |
++
++The demo should use changes in the first row. Examples that `terraform validate`, `plan`
++and `apply` all accept: a security group opened to `0.0.0.0/0`, an S3 public-access
++block switched off, a database made public, encryption disabled, an OIDC trust `sub`
++widened to `repo:org/repo:*`.
++
++## What InfraSec checks (all deterministic; the LLM never changes a verdict)
++
++| Code | Catches | Agent auto-fix |
++|---|---|---|
++| `OIDC_TRUST_WIDENED` | GitHub OIDC trust condition loosened | yes (re-pin `sub`) |
++| `NETWORK_OPEN_TO_WORLD` | new ingress from 0.0.0.0/0 or ::/0 | yes |
++| `S3_PUBLIC_ACCESS_LOOSENED` | public-access-block off, public ACL, `Principal: "*"` policy | yes |
++| `DB_PUBLICLY_ACCESSIBLE` | RDS made public | yes |
++| `ENCRYPTION_DISABLED` | storage/volume encryption turned off | yes |
++| `IAM_RESOURCE_TOUCHED` | any IAM/policy resource | no, needs a human |
++| `NEW_RESOURCE_TYPE` | first use of a resource type | no, needs a human |
++| `COST_THRESHOLD_EXCEEDED` | >= $2/mo or 40% of baseline | no, needs a human |
++| `PARSE_ERROR` / `UNKNOWN_ACTION` | fails closed | no, needs a human |
++
++## Suggest: generate the right infra code, then verify it
++
++InfraSec also reads your repo and suggests the infrastructure it needs, so the first deploy
++does not fail on IAM / OIDC trial and error. It is deterministic; the Duo agent reviews it.
++
++```bash
++python scripts/infrasec_suggest.py --root . --repo ORG/REPO    # writes suggested-infra/*.tf + report
++```
++
++| Detects | Suggests |
++|---|---|
++| boto3 / `@aws-sdk` calls (file:line evidence) | Least-privilege IAM policy. Actions derived from the calls, resources as variables, never `"*"` |
++| CI uses `role-to-assume` / `id_tokens` | OIDC role trusted for ONE repo + branch (`StringEquals`, no wildcard) |
++| `role-to-assume` without `permissions: id-token: write` | The classic silent failure, flagged as critical with the fix |
++| AWS SDK used but not in requirements / package.json | Add the missing package |
++| Secret-looking env vars (`*_TOKEN`, `*_KEY`, ...) | Route to Secrets Manager by ARN, not plain env |
++| Services not on the verified list | Marked `check` so a human verifies the derived action |
++
++Generate, then verify: suggestions always touch IAM, so the gate holds them for a human
++(by design). The `infrasec-suggest` flow opens them as a merge request and never auto-merges.
++
++## Lifecycle stages touched
++
++Plan (agent note), Create (agent commit), Verify (fmt/validate/tests), Secure (security
++gate), Release (auto deploy), Govern (decision + reasoning recorded per push),
++Package and Monitor only if you add real jobs for them. Claim only what appears in your
++pipeline history.
++
++## Run it
++
++```bash
++pip install pytest python-hcl2 && python -m pytest tests/ -q       # 40 tests, no AWS needed
++python scripts/infrasec_decide.py --plan demo/plans/safe.json      --ci-status pass   # exit 0
++python scripts/infrasec_decide.py --plan demo/plans/ssh_open.json  --ci-status pass   # exit 2, value: gate
++python scripts/infrasec_decide.py --plan demo/plans/ssh_open.json  --ci-status fail   # exit 3, value: diagnosis
++```
++
++In GitLab: push this repo, enable `flows/infrasec-autofix.yaml` (Automate > Flows) with the
++"pipeline failed" trigger, then push a change to `demo-target/main.tf` that sets the
++security group's `cidr_blocks` to `["0.0.0.0/0"]`.
++
++## Honest limits
++
++- The flow YAML and its toolset names are unverified against a live GitLab instance.
++- Terraform is not installed in the authoring sandbox: `.gitlab-ci.yml` and the offline
++  `terraform plan` in `demo-target/` have not been run end to end. Set `DEMO_PLAN=demo/plans/ssh_open.json`
++  on a manual pipeline to exercise the gate without Terraform.
++- Without AWS credentials the deploy jobs print "DEMO MODE" instead of applying.
++- The suggester only knows AWS SDK calls in Python and JS/TS, GitHub and GitLab CI, and Terraform output. Actions on services outside its verified list are derived from method names and marked `check`. Generated Terraform parses (tested) but was not run through `terraform validate`.
++- Known-resource-type history is a committed file (`.infrasec/known_types.json`) in the
++  GitLab pipeline; the AWS Lambda deployment keeps it in DynamoDB.
+diff --git a/flows/infrasec-autofix.yaml b/flows/infrasec-autofix.yaml
+new file mode 100644
+index 0000000..bb52b13
+--- /dev/null
++++ b/flows/infrasec-autofix.yaml
+@@ -0,0 +1,93 @@
++# InfraSec auto-fix flow for GitLab Duo Agent Platform (custom flow).
++#
++# Enable it at Automate > Flows and set its trigger to "pipeline failed", so it runs
++# on every held push with no human prompt (hands-off).
++#
++# DRAFT: component/prompt structure follows GitLab's custom-flow YAML, but toolset
++# names are from memory and could not be validated against your instance. Paste into
++# the flow editor, fix anything it flags (tool names are the likeliest), then run it.
++version: "v1"
++environment: ambient
++
++components:
++  - name: "explain_hold"
++    type: AgentComponent
++    prompt_id: "explain_prompt"
++    inputs:
++      - from: "context:goal"
++        as: "trigger"
++    toolset:
++      - "get_pipeline_failing_jobs"
++      - "get_job_logs"
++      - "get_repository_file"
++      - "create_merge_request_note"
++      - "create_commit_note"
++
++  - name: "apply_fix"
++    type: AgentComponent
++    prompt_id: "fix_prompt"
++    inputs:
++      - from: "context:explain_hold.final_answer"
++        as: "explanation"
++    toolset:
++      - "get_repository_file"
++      - "list_repository_tree"
++      - "create_commit"
++      - "create_merge_request_note"
++      - "update_merge_request"
++
++prompts:
++  - prompt_id: "explain_prompt"
++    name: "InfraSec explainer"
++    unit_primitives: ["duo_agent_platform"]
++    prompt_template:
++      system: |
++        A pipeline failed. Find the `infrasec:decide` job and read its log, which contains
++        the InfraSec report (also saved as infrasec-report.md / infrasec-decision.json).
++        The decision is made by deterministic code: you must NEVER overrule, re-score or
++        soften it. Post a note on the merge request for this branch (or on the commit if
++        there is no MR) with:
++          1. What was blocked, in one sentence.
++          2. Why InfraSec did not let it pass: each finding code and the exact resource.
++          3. The "value added" line verbatim. If it says CI alone would have shipped the
++             change, say so plainly. If CI was already failing, say the failure is CI's and
++             that you are only adding the diagnosis.
++          4. The fix hint for each finding.
++        Finish with exactly two lines:
++          FIXABLE: yes|no   (yes only if every finding code is one of NETWORK_OPEN_TO_WORLD,
++                             S3_PUBLIC_ACCESS_LOOSENED, DB_PUBLICLY_ACCESSIBLE,
++                             ENCRYPTION_DISABLED, OIDC_TRUST_WIDENED and CI itself did not fail)
++          ATTEMPT: <number from the report>
++      user: "{{trigger}}"
++      placeholder: history
++
++  - prompt_id: "fix_prompt"
++    name: "InfraSec remediator"
++    unit_primitives: ["duo_agent_platform"]
++    prompt_template:
++      system: |
++        Read the explanation. Then:
++        - If FIXABLE is no, or ATTEMPT is 2 or more: do not commit anything. Post a note saying
++          a human is needed and why, add the label `infrasec::needs-human`, and stop.
++        - Otherwise, edit ONLY the Terraform file that defines each flagged resource and make
++          the smallest change that removes the loosening: restore the narrow CIDR (never
++          0.0.0.0/0 or ::/0), set all four S3 public-access-block flags to true, set
++          publicly_accessible = false, enable encryption, or pin an OIDC `sub` to one repo and
++          ref. Never loosen anything, never touch unrelated resources, never edit IAM
++          permissions, and never change scripts/, agent/, tests/, .gitlab-ci.yml or
++          .infrasec/.
++        - Commit to the branch with the message
++          `fix(infrasec): <one-line summary> [infrasec-autofix]` so the pipeline counts attempts.
++        - Post a note listing the files changed and why, then add `/merge` on its own line so
++          GitLab merges ONLY if the re-run pipeline passes the InfraSec gate.
++      user: "{{explanation}}"
++      placeholder: history
++
++routers:
++  - from: "explain_hold"
++    to: "apply_fix"
++  - from: "apply_fix"
++    to: "end"
++
++flow:
++  entry_point: "explain_hold"
+diff --git a/flows/infrasec-suggest.yaml b/flows/infrasec-suggest.yaml
+new file mode 100644
+index 0000000..bf88bb0
+--- /dev/null
++++ b/flows/infrasec-suggest.yaml
+@@ -0,0 +1,59 @@
++# InfraSec suggest flow for GitLab Duo Agent Platform (custom flow).
++#
++# Mention it on an issue or MR (`@infrasec-suggest`) or assign it. It reviews the
++# deterministic suggestions from the `infrasec:suggest` job against the real code and
++# opens a merge request with the infrastructure code the repo needs.
++#
++# DRAFT: toolset names are from memory and unverified against a live instance. Paste
++# into the flow editor and fix whatever it flags.
++version: "v1"
++environment: ambient
++
++components:
++  - name: "review_suggestions"
++    type: AgentComponent
++    prompt_id: "review_prompt"
++    inputs:
++      - from: "context:goal"
++        as: "request"
++    toolset:
++      - "get_repository_file"
++      - "list_repository_tree"
++      - "get_job_logs"
++      - "get_pipeline_failing_jobs"
++      - "create_commit"
++      - "create_merge_request"
++      - "create_merge_request_note"
++
++prompts:
++  - prompt_id: "review_prompt"
++    name: "InfraSec infrastructure suggester"
++    unit_primitives: ["duo_agent_platform"]
++    prompt_template:
++      system: |
++        Goal: give this repository the infrastructure code it needs so its first deploy
++        does not fail on IAM, OIDC, packages or environment configuration.
++
++        1. Read the output of the latest `infrasec:suggest` job (infrasec-suggestions.md /
++           .json and the generated suggested-infra/*.tf). Those were produced by
++           deterministic code that read the SDK calls in this repo. Do not invent IAM
++           actions that are not in that output, and do not drop findings.
++        2. Check each suggestion against the actual source files it cites (file:line).
++           Fix the Terraform where the real code shows a better scope (for example a
++           specific table or key prefix) but NEVER introduce a "*" resource, a wildcard
++           action, StringLike trust, or AdministratorAccess.
++        3. Open a merge request that adds the files under `infra/suggested/` and applies
++           the non-IAM fixes (add the missing package to requirements, add
++           `permissions: id-token: write` to the workflow). Describe each change with its
++           evidence.
++        4. Do NOT add `/merge` and do NOT enable auto-merge. IAM and trust changes always
++           need a human reviewer. Say so in the MR description.
++      user: "{{request}}"
++      placeholder: history
++
++routers:
++  - from: "review_suggestions"
++    to: "end"
++
++flow:
++  entry_point: "review_suggestions"
+diff --git a/scripts/infrasec_decide.py b/scripts/infrasec_decide.py
+new file mode 100644
+index 0000000..3fb864f
+--- /dev/null
++++ b/scripts/infrasec_decide.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""InfraSec offline gate.
++
++Runs the deterministic decision engine on a `terraform show -json` plan with no
++AWS account or network. Intended for the GitLab pipeline (hands-off loop).
++
++  python scripts/infrasec_decide.py --plan plan.json --ci-status pass
++
++Writes infrasec-decision.json and infrasec-report.md.
++Exit codes: 0 = pass, 2 = held by InfraSec, 3 = conventional CI failed.
++
++`--ci-status` is what the ordinary CI checks (fmt/validate/tests) said. It lets
++the report say honestly whether InfraSec was the thing that stopped the change
++(value_added = "gate") or whether CI was going to fail anyway
++(value_added = "diagnosis": InfraSec only explains and proposes the fix).
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from agent.plan_parser import parse_plan_json  # noqa: E402
++from agent.cost_estimate import estimate_cost_delta  # noqa: E402
++from agent.decision_engine import evaluate  # noqa: E402
++from agent.fix_hints import FIX_HINTS, AUTO_FIXABLE  # noqa: E402
++
++
++MAX_AUTOFIX_ATTEMPTS = 2
++
++
++def value_added(action: str, ci_status: str) -> str:
++    if action == "auto_apply":
++        return "none"
++    return {"pass": "gate", "fail": "diagnosis"}.get(ci_status, "unverified")
++
++
++VALUE_TEXT = {
++    "none": "Nothing to add: the change is safe and CI passed.",
++    "gate": "**CI alone would have shipped this.** Every conventional check passed. InfraSec is the only thing that stopped it.",
++    "diagnosis": "CI was already failing, so InfraSec is not the gate here. It adds the diagnosis and a proposed fix only.",
++    "unverified": "CI status was not provided, so it is unknown whether CI alone would have caught this.",
++}
++
++
++def build_report(decision: dict, ci_status: str, added: str, attempt: int) -> str:
++    action = decision["action"]
++    head = "PASS" if action == "auto_apply" and ci_status != "fail" else "HELD"
++    lines = [f"## InfraSec: **{head}**", ""]
++    lines.append(f"- Conventional CI (fmt / validate / tests): **{ci_status.upper()}**")
++    lines.append(f"- InfraSec decision: **{action}** (confidence {decision['confidence']:.2f})")
++    lines.append(f"- Value added: {VALUE_TEXT[added]}")
++    if attempt:
++        lines.append(f"- Auto-fix attempts so far: {attempt} of {MAX_AUTOFIX_ATTEMPTS}")
++    if head == "HELD" and attempt >= MAX_AUTOFIX_ATTEMPTS:
++        lines.append("- **Auto-fix budget used up: escalated to a human.**")
++    lines += ["", f"**Why:** {decision['reasoning']}", ""]
++    flags = decision["risk_flags"]
++    if flags:
++        lines += ["| Severity | Code | Finding | How to fix | Agent may auto-fix |", "|---|---|---|---|---|"]
++        for f in flags:
++            fixable = "yes" if f["code"] in AUTO_FIXABLE else "no, needs a human"
++            lines.append(f"| {f['severity']} | `{f['code']}` | {f['message']} | {FIX_HINTS.get(f['code'], '')} | {fixable} |")
++    elif action == "auto_apply":
++        lines.append("No findings. Safe to deploy.")
++    return "\n".join(lines) + "\n"
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description="InfraSec offline gate")
++    ap.add_argument("--plan", default="plan.json")
++    ap.add_argument("--known-types", default=".infrasec/known_types.json")
++    ap.add_argument("--baseline-usd", type=float, default=float(os.environ.get("BASELINE_USD", "5")))
++    ap.add_argument("--ci-status", choices=["pass", "fail", "unknown"], default=os.environ.get("CI_STATUS", "unknown"))
++    ap.add_argument("--attempt", type=int, default=int(os.environ.get("INFRASEC_ATTEMPT", "0")))
++    ap.add_argument("--out-dir", default=".")
++    args = ap.parse_args(argv)
++
++    known: set[str] = set()
++    kt = Path(args.known_types)
++    if kt.exists():
++        known = set(json.loads(kt.read_text()))
++
++    parsed = parse_plan_json(Path(args.plan).read_text(encoding="utf-8"))
++    cost = estimate_cost_delta(parsed.resource_changes, baseline_usd=args.baseline_usd)
++    decision = evaluate(parsed, cost, known_resource_types=known).to_dict()
++    added = value_added(decision["action"], args.ci_status)
++    decision.update(ci_status=args.ci_status, value_added=added, attempt=args.attempt)
++
++    out = Path(args.out_dir)
++    (out / "infrasec-decision.json").write_text(json.dumps(decision, indent=2))
++    report = build_report(decision, args.ci_status, added, args.attempt)
++    (out / "infrasec-report.md").write_text(report)
++    print(report)
++
++    if args.ci_status == "fail":
++        return 3
++    return 0 if decision["action"] == "auto_apply" else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/infrasec_suggest.py b/scripts/infrasec_suggest.py
+new file mode 100644
+index 0000000..95f67ae
+--- /dev/null
++++ b/scripts/infrasec_suggest.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Suggest infrastructure code for a repository (IAM, OIDC trust, env, packages).
++
++  python scripts/infrasec_suggest.py --root . --repo ORG/REPO
++
++Writes suggested-infra/*.tf, infrasec-suggestions.md and infrasec-suggestions.json.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from dataclasses import asdict
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from agent.suggest import suggest, to_markdown  # noqa: E402
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description="InfraSec infra-code suggester")
++    ap.add_argument("--root", default=".")
++    ap.add_argument("--repo", default=None, help="ORG/REPO used to pin the OIDC trust (default: git remote)")
++    ap.add_argument("--out", default="suggested-infra")
++    ap.add_argument("--report-dir", default=".")
++    args = ap.parse_args(argv)
++
++    s = suggest(args.root, args.repo)
++    out = Path(args.out)
++    if s.files:
++        out.mkdir(parents=True, exist_ok=True)
++        for name, body in s.files.items():
++            (out / name).write_text(body)
++    rd = Path(args.report_dir)
++    md = to_markdown(s)
++    (rd / "infrasec-suggestions.md").write_text(md)
++    (rd / "infrasec-suggestions.json").write_text(json.dumps(
++        {"repo": s.repo, "findings": [asdict(f) for f in s.findings],
++         "usages": [asdict(u) | {"iam": u.iam} for u in s.usages],
++         "files": sorted(s.files)}, indent=2))
++    print(md)
++    return 1 if any(f.severity == "critical" for f in s.findings) else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/test_security_checks.py b/tests/test_security_checks.py
+new file mode 100644
+index 0000000..7e1eaed
+--- /dev/null
++++ b/tests/test_security_checks.py
+@@ -0,0 +1,108 @@
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from agent.plan_parser import parse_plan_json
++from agent.cost_estimate import estimate_cost_delta
++from agent.decision_engine import evaluate
++
++
++def decide(*changes, known=None):
++    plan = json.dumps({"resource_changes": list(changes)})
++    parsed = parse_plan_json(plan)
++    cost = estimate_cost_delta(parsed.resource_changes, baseline_usd=5.0)
++    return evaluate(parsed, cost, known_resource_types=known if known is not None else {c["type"] for c in changes})
++
++
++def rc(rtype, actions, before, after, name="x"):
++    return {"address": f"{rtype}.{name}", "type": rtype, "name": name,
++            "change": {"actions": actions, "before": before, "after": after}}
++
++
++def codes(decision):
++    return [f.code for f in decision.risk_flags]
++
++
++def sg_ingress(cidr, port):
++    return {"ingress": [{"cidr_blocks": [cidr], "from_port": port, "to_port": port, "protocol": "tcp"}]}
++
++
++def test_ssh_opened_to_world_holds_as_critical():
++    d = decide(rc("aws_security_group", ["update"], sg_ingress("10.0.0.0/8", 22), sg_ingress("0.0.0.0/0", 22)))
++    assert d.action == "hold"
++    flag = next(f for f in d.risk_flags if f.code == "NETWORK_OPEN_TO_WORLD")
++    assert flag.severity == "critical" and "tcp/22" in flag.message
++
++
++def test_web_port_open_to_world_still_holds_but_is_warn():
++    d = decide(rc("aws_security_group", ["create"], None, sg_ingress("0.0.0.0/0", 443)))
++    assert d.action == "hold"
++    assert next(f for f in d.risk_flags if f.code == "NETWORK_OPEN_TO_WORLD").severity == "warn"
++
++
++def test_preexisting_open_rule_is_not_reflagged():
++    same = sg_ingress("0.0.0.0/0", 443)
++    d = decide(rc("aws_security_group", ["update"], same, same))
++    assert "NETWORK_OPEN_TO_WORLD" not in codes(d)
++
++
++def test_private_ingress_auto_applies():
++    d = decide(rc("aws_security_group", ["create"], None, sg_ingress("10.0.0.0/8", 5432)))
++    assert d.action == "auto_apply"
++
++
++def test_removing_a_rule_never_flags():
++    d = decide(rc("aws_security_group", ["delete"], sg_ingress("0.0.0.0/0", 22), None))
++    assert "NETWORK_OPEN_TO_WORLD" not in codes(d)
++
++
++def test_ipv6_world_and_standalone_rule_types():
++    d = decide(rc("aws_vpc_security_group_ingress_rule", ["create"], None,
++                  {"cidr_ipv6": "::/0", "from_port": 3389, "to_port": 3389, "ip_protocol": "tcp"}))
++    assert d.action == "hold" and "NETWORK_OPEN_TO_WORLD" in codes(d)
++    d = decide(rc("aws_security_group_rule", ["create"], None,
++                  {"type": "ingress", "cidr_blocks": ["0.0.0.0/0"], "from_port": 0, "to_port": 65535, "protocol": "tcp"}))
++    assert d.action == "hold"
++
++
++def test_s3_public_access_block_disabled_holds():
++    before = {k: True for k in ("block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets")}
++    after = dict(before, block_public_policy=False)
++    d = decide(rc("aws_s3_bucket_public_access_block", ["update"], before, after))
++    assert d.action == "hold"
++    assert "block_public_policy" in next(f for f in d.risk_flags if f.code == "S3_PUBLIC_ACCESS_LOOSENED").message
++
++
++def test_s3_public_access_block_all_true_is_safe():
++    on = {k: True for k in ("block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets")}
++    assert decide(rc("aws_s3_bucket_public_access_block", ["create"], None, on)).action == "auto_apply"
++
++
++def test_s3_public_acl_and_public_policy_hold():
++    assert decide(rc("aws_s3_bucket_acl", ["create"], None, {"acl": "public-read"})).action == "hold"
++    public = json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "*"}]})
++    assert decide(rc("aws_s3_bucket_policy", ["create"], None, {"policy": public})).action == "hold"
++
++
++def test_conditioned_or_private_bucket_policy_is_not_public():
++    scoped = json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
++                                        "Resource": "*", "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}}}]})
++    assert decide(rc("aws_s3_bucket_policy", ["create"], None, {"policy": scoped})).action == "auto_apply"
++
++
++def test_public_database_and_encryption_off_hold():
++    assert decide(rc("aws_db_instance", ["update"], {"publicly_accessible": False}, {"publicly_accessible": True}),
++                  known={"aws_db_instance"}).action == "hold"
++    d = decide(rc("aws_ebs_volume", ["create"], None, {"encrypted": False}))
++    assert d.action == "hold" and "ENCRYPTION_DISABLED" in codes(d)
++
++
++def test_security_flags_and_iam_touch_are_reported_together():
++    d = decide(
++        rc("aws_security_group", ["create"], None, sg_ingress("0.0.0.0/0", 22), name="a"),
++        rc("aws_iam_role_policy", ["update"], {"policy": "{}"}, {"policy": "{}"}, name="b"),
++    )
++    assert d.action == "hold"
++    assert {"NETWORK_OPEN_TO_WORLD", "IAM_RESOURCE_TOUCHED"} <= set(codes(d))
+diff --git a/tests/test_suggest.py b/tests/test_suggest.py
+new file mode 100644
+index 0000000..8c02b53
+--- /dev/null
++++ b/tests/test_suggest.py
+@@ -0,0 +1,145 @@
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from agent.suggest import suggest, to_markdown
++
++APP = '''
++import os
++import boto3
++
++s3 = boto3.client("s3")
++ddb = boto3.resource("dynamodb")
++table = ddb.Table("jobs")
++sqs = boto3.client("sqs")
++
++def run():
++    s3.get_object(Bucket="b", Key="k")
++    s3.upload_file("a", "b", "c")
++    s3.list_objects_v2(Bucket="b")
++    table.put_item(Item={})
++    boto3.client("sns").publish(TopicArn="t", Message="m")
++    sqs.get_paginator("list_queues")
++    token = os.environ["SLACK_API_TOKEN"]
++    level = os.environ.get("LOG_LEVEL")
++    region = os.getenv("AWS_REGION")
++'''
++
++WORKFLOW_BAD = """
++on: push
++jobs:
++  deploy:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: aws-actions/configure-aws-credentials@v4
++        with:
++          role-to-assume: arn:aws:iam::1:role/x
++"""
++
++WORKFLOW_OK = "permissions:\n  id-token: write\n" + WORKFLOW_BAD
++
++
++def make_repo(tmp_path, workflow=WORKFLOW_BAD, requirements="requests\n"):
++    (tmp_path / "app.py").write_text(APP)
++    (tmp_path / "requirements.txt").write_text(requirements)
++    wf = tmp_path / ".github" / "workflows"
++    wf.mkdir(parents=True)
++    (wf / "deploy.yml").write_text(workflow)
++    return tmp_path
++
++
++def codes(s):
++    return [f.code for f in s.findings]
++
++
++def test_iam_actions_derived_from_real_sdk_calls(tmp_path):
++    s = suggest(make_repo(tmp_path), repo="acme/ml-pipeline")
++    actions = {u.iam for u in s.usages}
++    assert {"s3:GetObject", "s3:PutObject", "s3:ListBucket", "dynamodb:PutItem", "sns:Publish",
++            "sqs:ListQueues"} <= actions
++    assert all(u.line > 0 for u in s.usages)
++
++
++def test_generated_iam_never_uses_wildcard_resources(tmp_path):
++    s = suggest(make_repo(tmp_path), repo="acme/ml-pipeline")
++    iam = s.files["iam.tf"]
++    assert 'resources = ["*"]' not in iam and '"*"' not in iam
++    assert '"${var.s3_bucket_arn}/*"' in iam          # objects scoped to the bucket
++    assert "resources = [var.s3_bucket_arn]" in iam   # ListBucket on the bucket itself
++    for var in ("s3_bucket_arn", "dynamodb_table_arn", "sns_topic_arn", "sqs_queue_arn"):
++        assert f'variable "{var}"' in s.files["variables.tf"]
++
++
++def test_missing_id_token_permission_is_flagged(tmp_path):
++    s = suggest(make_repo(tmp_path), repo="acme/ml-pipeline")
++    f = next(f for f in s.findings if f.code == "OIDC_MISSING_ID_TOKEN_PERMISSION")
++    assert f.severity == "critical" and "id-token: write" in f.fix
++
++
++def test_correct_workflow_is_not_flagged(tmp_path):
++    s = suggest(make_repo(tmp_path, workflow=WORKFLOW_OK), repo="acme/ml-pipeline")
++    assert "OIDC_MISSING_ID_TOKEN_PERMISSION" not in codes(s)
++
++
++def test_oidc_trust_is_pinned_to_repo_and_branch(tmp_path):
++    s = suggest(make_repo(tmp_path), repo="acme/ml-pipeline")
++    oidc = s.files["oidc.tf"]
++    assert 'repo:acme/ml-pipeline:ref:refs/heads/main' in oidc
++    assert "StringEquals" in oidc and "StringLike" not in oidc
++    assert "repo:acme/ml-pipeline:*" not in oidc
++
++
++def test_unknown_repo_uses_placeholder_and_says_so(tmp_path):
++    s = suggest(make_repo(tmp_path))  # tmp_path is not a git repo
++    assert "REPO_UNKNOWN" in codes(s) and "repo:ORG/REPO:" in s.files["oidc.tf"]
++
++
++def test_missing_boto3_package_flagged_and_present_is_not(tmp_path):
++    assert "PACKAGE_MISSING" in codes(suggest(make_repo(tmp_path), repo="a/b"))
++    ok = tmp_path / "ok"
++    ok.mkdir()
++    assert "PACKAGE_MISSING" not in codes(suggest(make_repo(ok, requirements="boto3>=1.34\n"), repo="a/b"))
++
++
++def test_secret_env_var_flagged_and_routed_to_secret_arns(tmp_path):
++    s = suggest(make_repo(tmp_path), repo="a/b")
++    assert any(f.code == "SECRET_IN_ENV" and "SLACK_API_TOKEN" in f.message for f in s.findings)
++    env = s.files["app_env.tf"]
++    assert "LOG_LEVEL" in env and "SLACK_API_TOKEN" in env
++    assert "AWS_REGION" not in env                      # ambient, ignored
++    assert env.index("SLACK_API_TOKEN") > env.index("app_secret_arns")   # in the secrets map only
++
++
++def test_javascript_sdk_commands(tmp_path):
++    (tmp_path / "index.mjs").write_text(
++        'import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";\n'
++        'import { PublishCommand } from "@aws-sdk/client-sns";\n')
++    (tmp_path / "package.json").write_text('{"dependencies": {"@aws-sdk/client-s3": "^3.0.0"}}')
++    s = suggest(tmp_path, repo="a/b")
++    assert {"s3:GetObject", "sns:Publish"} <= {u.iam for u in s.usages}
++    missing = [f for f in s.findings if f.code == "PACKAGE_MISSING"]
++    assert len(missing) == 1 and "client-sns" in missing[0].message
++
++
++def test_unverified_service_is_marked_check(tmp_path):
++    (tmp_path / "a.py").write_text('import boto3\nc = boto3.client("sagemaker")\nc.create_training_job()\n')
++    s = suggest(tmp_path, repo="a/b")
++    assert s.usages[0].iam == "sagemaker:CreateTrainingJob" and s.usages[0].confidence == "check"
++    assert "IAM_ACTION_UNVERIFIED" in codes(s)
++
++
++def test_repo_with_no_aws_usage_suggests_nothing(tmp_path):
++    (tmp_path / "x.py").write_text("print('hi')\n")
++    s = suggest(tmp_path, repo="a/b")
++    assert not s.files and "No infrastructure needs" in to_markdown(s)
++
++
++def test_generated_terraform_parses(tmp_path):
++    hcl2 = pytest.importorskip("hcl2")
++    s = suggest(make_repo(tmp_path), repo="acme/ml-pipeline")
++    import io
++    for name, body in s.files.items():
++        assert hcl2.load(io.StringIO(body)), name
