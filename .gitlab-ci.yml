@@ -1,0 +1,123 @@
+# InfraSec: hands-off infrastructure security gate on GitLab.
+#
+# Every push runs the pipeline. If the plan is safe it deploys; if InfraSec holds it
+# the pipeline fails, and the Duo flow (flows/infrasec-autofix.yaml) explains why,
+# commits a fix, and re-runs, escalating to a human only if it cannot fix safely.
+#
+# Variables you can set on a run:
+#   DEMO_PLAN    path to a saved plan (demo/plans/*.json) to skip `terraform plan`
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   enable a real `terraform apply`
+
+stages: [plan, ci, decide, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule"
+
+variables:
+  TF_DIR: demo-target
+
+infrasec:plan:
+  stage: plan
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - |
+      if [ -n "$DEMO_PLAN" ]; then
+        echo "Using saved plan $DEMO_PLAN"; cp "$DEMO_PLAN" plan.json
+      else
+        cd "$TF_DIR"
+        terraform init -input=false -backend=false
+        terraform plan -input=false -out=tfplan.binary
+        terraform show -json tfplan.binary > ../plan.json
+      fi
+  artifacts:
+    paths: [plan.json]
+
+# Conventional CI. These report their status instead of failing the job, so InfraSec can
+# say whether CI alone would have caught a problem (the report's "value added" line).
+ci:terraform:
+  stage: ci
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - cd "$TF_DIR"
+    - set +e
+    - terraform fmt -check -recursive && terraform init -input=false -backend=false >/dev/null && terraform validate
+    - rc=$?
+    - if [ $rc -eq 0 ]; then echo "TF_CI=pass" > ../tf.env; else echo "TF_CI=fail" > ../tf.env; fi
+    - exit 0
+  artifacts:
+    reports:
+      dotenv: tf.env
+
+ci:tests:
+  stage: ci
+  image: python:3.12-slim
+  script:
+    - pip install --quiet pytest
+    - set +e
+    - python -m pytest tests/ -q
+    - rc=$?
+    - if [ $rc -eq 0 ]; then echo "TEST_CI=pass" > tests.env; else echo "TEST_CI=fail" > tests.env; fi
+    - exit 0
+  artifacts:
+    reports:
+      dotenv: tests.env
+
+# Suggests infrastructure code (least-privilege IAM, pinned OIDC trust, env, packages) by
+# reading this repo. Manual and non-blocking so it never interferes with the hands-off
+# gate. The `infrasec-suggest` Duo flow turns its output into a merge request.
+infrasec:suggest:
+  stage: ci
+  image: python:3.12-slim
+  when: manual
+  allow_failure: true
+  script:
+    - python scripts/infrasec_suggest.py --root . --repo "${SUGGEST_REPO:-$CI_PROJECT_PATH}"
+  artifacts:
+    when: always
+    paths: [suggested-infra/, infrasec-suggestions.md, infrasec-suggestions.json]
+
+# The gate. Fails the pipeline if InfraSec holds the change OR conventional CI failed.
+infrasec:decide:
+  stage: decide
+  image: python:3.12-slim
+  needs: ["infrasec:plan", "ci:terraform", "ci:tests"]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+  script:
+    - export CI_STATUS=$([ "$TF_CI" = "pass" ] && [ "$TEST_CI" = "pass" ] && echo pass || echo fail)
+    - export INFRASEC_ATTEMPT=$(git log -n 20 --format=%B | grep -c '\[infrasec-autofix\]' || true)
+    - python scripts/infrasec_decide.py --plan plan.json --ci-status "$CI_STATUS" --attempt "$INFRASEC_ATTEMPT"
+  artifacts:
+    when: always
+    paths: [infrasec-decision.json, infrasec-report.md]
+
+# Hands-off deployment on the default branch once the gate passes.
+.deploy:
+  stage: deploy
+  needs: ["infrasec:decide"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - |
+      if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+        cd "$TF_DIR" && terraform init -input=false && terraform apply -input=false -auto-approve
+      else
+        echo "DEMO MODE: no AWS credentials set, so nothing is applied. Gate passed; this is where terraform apply runs."
+      fi
+
+deploy:staging:
+  extends: .deploy
+  environment: { name: staging }
+
+deploy:production:
+  extends: .deploy
+  needs: ["infrasec:decide", "deploy:staging"]
+  environment: { name: production }

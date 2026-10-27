@@ -21,6 +21,7 @@ from typing import Optional
 from .plan_parser import ParsedPlan, ResourceChange
 from .oidc_diff import diff_trust_policy, OidcDiffResult
 from .cost_estimate import CostEstimateResult
+from .security_checks import check_security_loosening
 
 COST_THRESHOLD_USD = 2.0
 COST_THRESHOLD_PCT = 0.40
@@ -127,6 +128,28 @@ def evaluate(
             confidence=0.98,
             oidc_diff=oidc_result,
             highest_priority=True,
+        )
+
+    # Silent security loosening on non-IAM resources (open ingress, public S3,
+    # public DB, encryption off). These pass validate/plan/apply, so CI alone
+    # would ship them.
+    security_flags = check_security_loosening(parsed_plan.resource_changes)
+    if security_flags:
+        flags.extend(security_flags)
+        for rc in parsed_plan.touched_iam:
+            flags.append(RiskFlag(
+                "IAM_RESOURCE_TOUCHED",
+                f"{rc.address} ({rc.type}) is an IAM/policy resource and was {'/'.join(rc.actions)}.",
+                "warn",
+            ))
+        return Decision(
+            action="hold",
+            reasoning="Plan loosens a security control (" + ", ".join(sorted({f.code for f in security_flags})) +
+                      "). A change like this is valid Terraform and applies cleanly, so it is held for review.",
+            risk_flags=flags,
+            cost_delta_usd=cost_result.delta_usd,
+            confidence=0.97,
+            oidc_diff=oidc_result,
         )
 
     # IAM/policy resource types touched at all.

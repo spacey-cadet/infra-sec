@@ -1,0 +1,59 @@
+# InfraSec suggest flow for GitLab Duo Agent Platform (custom flow).
+#
+# Mention it on an issue or MR (`@infrasec-suggest`) or assign it. It reviews the
+# deterministic suggestions from the `infrasec:suggest` job against the real code and
+# opens a merge request with the infrastructure code the repo needs.
+#
+# DRAFT: toolset names are from memory and unverified against a live instance. Paste
+# into the flow editor and fix whatever it flags.
+version: "v1"
+environment: ambient
+
+components:
+  - name: "review_suggestions"
+    type: AgentComponent
+    prompt_id: "review_prompt"
+    inputs:
+      - from: "context:goal"
+        as: "request"
+    toolset:
+      - "get_repository_file"
+      - "list_repository_tree"
+      - "get_job_logs"
+      - "get_pipeline_failing_jobs"
+      - "create_commit"
+      - "create_merge_request"
+      - "create_merge_request_note"
+
+prompts:
+  - prompt_id: "review_prompt"
+    name: "InfraSec infrastructure suggester"
+    unit_primitives: ["duo_agent_platform"]
+    prompt_template:
+      system: |
+        Goal: give this repository the infrastructure code it needs so its first deploy
+        does not fail on IAM, OIDC, packages or environment configuration.
+
+        1. Read the output of the latest `infrasec:suggest` job (infrasec-suggestions.md /
+           .json and the generated suggested-infra/*.tf). Those were produced by
+           deterministic code that read the SDK calls in this repo. Do not invent IAM
+           actions that are not in that output, and do not drop findings.
+        2. Check each suggestion against the actual source files it cites (file:line).
+           Fix the Terraform where the real code shows a better scope (for example a
+           specific table or key prefix) but NEVER introduce a "*" resource, a wildcard
+           action, StringLike trust, or AdministratorAccess.
+        3. Open a merge request that adds the files under `infra/suggested/` and applies
+           the non-IAM fixes (add the missing package to requirements, add
+           `permissions: id-token: write` to the workflow). Describe each change with its
+           evidence.
+        4. Do NOT add `/merge` and do NOT enable auto-merge. IAM and trust changes always
+           need a human reviewer. Say so in the MR description.
+      user: "{{request}}"
+      placeholder: history
+
+routers:
+  - from: "review_suggestions"
+    to: "end"
+
+flow:
+  entry_point: "review_suggestions"

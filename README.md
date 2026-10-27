@@ -1,5 +1,7 @@
 # Infra Risk
 
+> **InfraSec (hackathon build):** hands-off GitLab gate with a Duo auto-fix flow and an infra-code suggester. See [docs/INFRASEC.md](docs/INFRASEC.md).
+
 Infra Risk reviews Terraform plans and returns a deterministic `auto_apply` or
 `hold` decision through an IAM-authenticated decision API. The consuming
 DevOps pipeline runs Terraform and calls the lightweight `infra-risk` Python

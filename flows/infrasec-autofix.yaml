@@ -1,0 +1,93 @@
+# InfraSec auto-fix flow for GitLab Duo Agent Platform (custom flow).
+#
+# Enable it at Automate > Flows and set its trigger to "pipeline failed", so it runs
+# on every held push with no human prompt (hands-off).
+#
+# DRAFT: component/prompt structure follows GitLab's custom-flow YAML, but toolset
+# names are from memory and could not be validated against your instance. Paste into
+# the flow editor, fix anything it flags (tool names are the likeliest), then run it.
+version: "v1"
+environment: ambient
+
+components:
+  - name: "explain_hold"
+    type: AgentComponent
+    prompt_id: "explain_prompt"
+    inputs:
+      - from: "context:goal"
+        as: "trigger"
+    toolset:
+      - "get_pipeline_failing_jobs"
+      - "get_job_logs"
+      - "get_repository_file"
+      - "create_merge_request_note"
+      - "create_commit_note"
+
+  - name: "apply_fix"
+    type: AgentComponent
+    prompt_id: "fix_prompt"
+    inputs:
+      - from: "context:explain_hold.final_answer"
+        as: "explanation"
+    toolset:
+      - "get_repository_file"
+      - "list_repository_tree"
+      - "create_commit"
+      - "create_merge_request_note"
+      - "update_merge_request"
+
+prompts:
+  - prompt_id: "explain_prompt"
+    name: "InfraSec explainer"
+    unit_primitives: ["duo_agent_platform"]
+    prompt_template:
+      system: |
+        A pipeline failed. Find the `infrasec:decide` job and read its log, which contains
+        the InfraSec report (also saved as infrasec-report.md / infrasec-decision.json).
+        The decision is made by deterministic code: you must NEVER overrule, re-score or
+        soften it. Post a note on the merge request for this branch (or on the commit if
+        there is no MR) with:
+          1. What was blocked, in one sentence.
+          2. Why InfraSec did not let it pass: each finding code and the exact resource.
+          3. The "value added" line verbatim. If it says CI alone would have shipped the
+             change, say so plainly. If CI was already failing, say the failure is CI's and
+             that you are only adding the diagnosis.
+          4. The fix hint for each finding.
+        Finish with exactly two lines:
+          FIXABLE: yes|no   (yes only if every finding code is one of NETWORK_OPEN_TO_WORLD,
+                             S3_PUBLIC_ACCESS_LOOSENED, DB_PUBLICLY_ACCESSIBLE,
+                             ENCRYPTION_DISABLED, OIDC_TRUST_WIDENED and CI itself did not fail)
+          ATTEMPT: <number from the report>
+      user: "{{trigger}}"
+      placeholder: history
+
+  - prompt_id: "fix_prompt"
+    name: "InfraSec remediator"
+    unit_primitives: ["duo_agent_platform"]
+    prompt_template:
+      system: |
+        Read the explanation. Then:
+        - If FIXABLE is no, or ATTEMPT is 2 or more: do not commit anything. Post a note saying
+          a human is needed and why, add the label `infrasec::needs-human`, and stop.
+        - Otherwise, edit ONLY the Terraform file that defines each flagged resource and make
+          the smallest change that removes the loosening: restore the narrow CIDR (never
+          0.0.0.0/0 or ::/0), set all four S3 public-access-block flags to true, set
+          publicly_accessible = false, enable encryption, or pin an OIDC `sub` to one repo and
+          ref. Never loosen anything, never touch unrelated resources, never edit IAM
+          permissions, and never change scripts/, agent/, tests/, .gitlab-ci.yml or
+          .infrasec/.
+        - Commit to the branch with the message
+          `fix(infrasec): <one-line summary> [infrasec-autofix]` so the pipeline counts attempts.
+        - Post a note listing the files changed and why, then add `/merge` on its own line so
+          GitLab merges ONLY if the re-run pipeline passes the InfraSec gate.
+      user: "{{explanation}}"
+      placeholder: history
+
+routers:
+  - from: "explain_hold"
+    to: "apply_fix"
+  - from: "apply_fix"
+    to: "end"
+
+flow:
+  entry_point: "explain_hold"
