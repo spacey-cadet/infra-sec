@@ -1,184 +1,173 @@
-# InfraSec
 
-**Agents that decide which infrastructure changes are safe to ship, and which need a human.**
+# Infra Sec
 
-InfraSec reads a Terraform plan and returns a deterministic verdict: `auto_apply` or `hold`.
-When it holds a change, a GitLab Duo agent explains why, commits the fix, and re-runs the
-pipeline. It also reads your repo and suggests the infrastructure code it needs (least-privilege
-IAM, a pinned OIDC trust, environment and package fixes).
+Infra Risk reviews Terraform plans and returns a deterministic `auto_apply` or
+`hold` decision through an IAM-authenticated decision API. The consuming
+DevOps pipeline runs Terraform and calls the lightweight `infra-risk` Python
+client; it does not need a separate guardian service, plan S3 bucket, or SQS
+queue.
 
-> Built for the GitLab Transcend hackathon: **Path B** (Bring Your Own), **Hands-off** autonomy.
-> Formerly "Infra Risk"; the Python package and CLI keep the `infra-risk` name.
+## Decision rules
 
-## Why
+The plain Python evaluator is authoritative and fail-closed:
 
-AI can write infrastructure code in seconds, but the review after it is still manual. The
-changes that hurt most are the ones that look fine to CI: a security group opened to the
-internet, an S3 public-access block switched off, an OIDC trust condition widened to
-`repo:org/repo:*`. They are valid Terraform, `validate` and `apply` accept them, and a normal
-pipeline ships them.
-
-**The rule we hold to: the AI explains and fixes, but never decides.** Every verdict comes from
-plain, tested Python. An LLM can never flip `hold` to `auto_apply`.
-
-## How it works
-
-```
-push ──> plan ──> conventional CI (fmt / validate / tests)
-                          │
-                          v
-                InfraSec gate (deterministic)
-              ┌───────────┴────────────┐
-           PASS                      HELD (pipeline fails)
-              │                         │
-     deploy staging -> prod    Duo flow fires on "pipeline failed":
-     (default branch)           1. explains why it did not pass
-                                2. commits the minimal fix  [infrasec-autofix]
-                                3. posts /merge: merges only if the re-run passes
-                                4. after 2 attempts, or for findings it must not
-                                   fix, labels infrasec::needs-human and stops
-```
-
-The report states what normal CI said, so it is honest about InfraSec's role:
-
-| CI said | InfraSec said | Value added |
-|---|---|---|
-| pass | held | **Gate.** CI alone would have shipped it. |
-| fail | held | **Diagnosis.** CI was failing anyway; InfraSec only explains and proposes a fix. |
-| pass | pass | None. |
-
-## What it checks
-
-The decision engine is an OR-gate: any single finding holds the plan. It fails closed.
-
-| Code | Catches | Agent may auto-fix |
-|---|---|---|
-| `OIDC_TRUST_WIDENED` | GitHub OIDC trust condition loosened | yes (re-pin `sub`) |
-| `NETWORK_OPEN_TO_WORLD` | new ingress from `0.0.0.0/0` or `::/0` | yes |
-| `S3_PUBLIC_ACCESS_LOOSENED` | public-access-block off, public ACL, `Principal: "*"` policy | yes |
-| `DB_PUBLICLY_ACCESSIBLE` | RDS made public | yes |
-| `ENCRYPTION_DISABLED` | storage or volume encryption turned off | yes |
-| `IAM_RESOURCE_TOUCHED` | any IAM or policy resource | no, human review |
-| `NEW_RESOURCE_TYPE` | first use of a resource type in this repo | no, human review |
-| `COST_THRESHOLD_EXCEEDED` | increase of $2/month or more, or 40% of baseline | no, human review |
-| `PARSE_ERROR`, `UNKNOWN_ACTION` | plan cannot be read safely | no, human review |
-
-Findings the agent must not fix (IAM, cost, new resource types, parse errors) always go to a human.
-
-## Suggest: generate the right infra code
-
-```bash
-python scripts/infrasec_suggest.py --root . --repo ORG/REPO    # writes suggested-infra/*.tf and a report
-```
-
-| It detects | It suggests |
+| Signal | Decision |
 |---|---|
-| boto3 and `@aws-sdk` calls (with file:line evidence) | Least-privilege IAM policy. Resources are variables, never `"*"` |
-| CI that uses `role-to-assume` or `id_tokens` | An OIDC role trusted for one repo and branch (`StringEquals`, no wildcard) |
-| `role-to-assume` without `permissions: id-token: write` | A critical finding with the fix |
-| AWS SDK used but not declared in requirements or package.json | The missing package |
-| Secret-looking environment variables (`*_TOKEN`, `*_KEY`) | Secrets Manager by ARN, not plain env |
-| Services outside the verified list | Marked `check` so a human verifies the derived action |
+| OIDC trust policy widened | Hold, highest priority |
+| IAM or policy resource touched | Hold |
+| New resource type in this repo's history | Hold |
+| Cost change is at least $2/month or 40% of baseline | Hold |
+| Parse error or unknown action | Hold |
+| No escalation rule triggered | Auto-apply |
 
-Suggestions always touch IAM, so the gate holds them for a human. The `infrasec-suggest` flow
-opens them as a merge request and never auto-merges.
+Fastino's open-weight GLiNER2.5-Decide checkpoint is available as an optional
+pipeline-side advisory classifier. Its output is attached to the API response,
+but does not change the deterministic action. This keeps the model useful for
+review context without giving a text classifier authority over infrastructure
+security policy. Fastino documents GLiNER2 as a local, CPU-capable schema
+classification/extraction library and lists Decide as its English
+classification specialist ([model and usage documentation](https://github.com/fastino-ai/GLiNER2#-available-models)).
 
-## Quick start
+## Use in a watched repository
 
-No AWS account is needed for the demo.
+Copy [`examples/infra-risk.yml`](examples/infra-risk.yml) to
+`.github/workflows/infra-risk.yml`, set repository variables
+`INFRA_RISK_CLIENT_ROLE_ARN` and `INFRA_RISK_API_URL`, then replace the sample
+Git URL with this repository's canonical URL. The action assumes the scoped
+AWS role through GitHub OIDC, creates a Terraform plan, and submits it to the
+decision API.
 
-```bash
-pip install pytest python-hcl2
-python -m pytest tests/ -q                                                       # 40 tests
+To use GLiNER locally in the CI runner, install the optional model extra and
+set its checkpoint:
 
-python scripts/infrasec_decide.py --plan demo/plans/safe.json     --ci-status pass   # exit 0: pass
-python scripts/infrasec_decide.py --plan demo/plans/ssh_open.json --ci-status pass   # exit 2: held, value "gate"
-python scripts/infrasec_decide.py --plan demo/plans/ssh_open.json --ci-status fail   # exit 3: value "diagnosis"
+```sh
+pip install 'infra-risk[gliner] @ git+https://github.com/YOUR_ORG/infra-risk.git'
+export INFRA_RISK_GLINER_MODEL=fastino/GLiNER2.5-Decide
+infra-risk --plan plan.json
 ```
 
-Exit codes: `0` pass, `2` held by InfraSec, `3` conventional CI failed.
+The default package is smaller: `pip install 'infra-risk[aws] ...'` installs
+only the AWS signing client. The GLiNER extra downloads PyTorch dependencies
+and the model weights on the runner.
 
-## Run it on GitLab
+## Decision API
 
-1. Push this repository to a GitLab project. Every push runs `.gitlab-ci.yml`.
-2. Enable the flows (Automate > Flows). Paste each file from `flows/` and fix anything the editor flags:
-   - `infrasec-autofix.yaml`: set the trigger to **pipeline failed**.
-   - `infrasec-suggest.yaml`: mention `@infrasec-suggest` on an issue or merge request.
-3. To exercise the gate without Terraform, run a manual pipeline with `DEMO_PLAN=demo/plans/ssh_open.json`.
-4. To trigger the full loop, change `cidr_blocks` in `demo-target/main.tf` to `["0.0.0.0/0"]` and push.
+`POST` a JSON object containing `repo`, `head_sha`, and `plan_json` to the
+Lambda Function URL. Requests are signed with AWS SigV4 and the endpoint
+requires AWS IAM authorization.
 
-Without AWS credentials the deploy jobs print `DEMO MODE` instead of applying.
-
-## The AWS decision API
-
-The original deployment: an IAM-authenticated Lambda Function URL that evaluates plans from any CI.
-
-`POST` JSON with `repo`, `head_sha` and `plan_json`, signed with AWS SigV4. The `infra-risk` client
-exits `0` for `auto_apply`, `2` for `hold`, and nonzero on request or credential errors; CI should
-treat every nonzero exit as blocked.
-
-For GitHub Actions, copy [`examples/infra-risk.yml`](examples/infra-risk.yml) into
-`.github/workflows/`, set the repository variables `INFRA_RISK_CLIENT_ROLE_ARN` and
-`INFRA_RISK_API_URL`, and replace the sample Git URL. Details are in [`docs/workflow.md`](docs/workflow.md).
-
-An optional advisory classifier (Fastino GLiNER2.5-Decide) can be attached to the response. It
-never changes the verdict. Install it with `pip install 'infra-risk[gliner] @ git+...'` and set
-`INFRA_RISK_GLINER_MODEL=fastino/GLiNER2.5-Decide`.
-
-### Deploy
-
-Requires AWS credentials, Terraform 1.5+ and Docker.
-
-```bash
-cd terraform
-cp terraform.tfvars.example terraform.tfvars      # set github_org, github_repo, allowed_ref, notification_email
-terraform init
-terraform apply -target=aws_ecr_repository.guardian          # create the ECR repository first
-# build and push the image to the ecr_repository_url output, then:
-terraform apply -var="infra_risk_image_uri=<ecr_repository_url>:latest"
-```
-
-Outputs: `decision_api_url` and `plan_submitter_role_arn`. Review the IAM trust inputs
-(`github_org`, `github_repo`, `allowed_ref`) before deploying. Build the image for `linux/amd64`.
+The Python CLI exits `0` for `auto_apply`, `2` for `hold`, and nonzero on
+request/credential errors. CI should treat all nonzero exits as blocked.
 
 ## Repository map
 
-| Path | What it is |
-|---|---|
-| `agent/` | `plan_parser`, `oidc_diff`, `cost_estimate`, `security_checks`, `decision_engine` (the verdict); `suggest` (infra-code suggester); `handler` (Lambda entry point) |
-| `scripts/infrasec_decide.py` | Offline gate used by the GitLab pipeline |
-| `scripts/infrasec_suggest.py` | Infra-code suggester CLI |
-| `flows/` | GitLab Duo flows: auto-fix and suggest |
-| `.gitlab-ci.yml` | Hands-off pipeline: plan, CI, gate, deploy |
-| `demo-target/`, `demo/plans/` | The infrastructure the demo guards, and saved plans |
-| `infra_risk/` | Small installable CI client (`infra-risk` command) |
-| `terraform/` | Lambda, OIDC access, decision history and notifications |
-| `docs/` | `INFRASEC.md`, `decision_engine.md`, `workflow.md` |
-| `tests/` | 40 tests: parser, OIDC diff, decision matrix, security checks, suggester |
+- `agent/plan_parser.py`, `agent/oidc_diff.py`, `agent/cost_estimate.py`,
+  `agent/decision_engine.py`: deterministic plan analysis.
+- `agent/handler.py`: synchronous Function URL API and Lambda entry point.
+- `infra_risk/`: small installable pipeline client (`infra-risk` command).
+- `terraform/`: Lambda, IAM OIDC access, decision history and notifications.
+- `docs/workflow.md`: API and pipeline integration details.
+- `tests/`: parser, OIDC diff, decision matrix, and optional agent wrapper coverage.
 
-## GitLab lifecycle stages
+## Deploy
 
-| Stage | What happens |
-|---|---|
-| Plan | The agent posts its explanation on the merge request |
-| Create | The agent commits the fix to the branch |
-| Verify | `terraform fmt`, `validate` and the test suite run |
-| Secure | The security gate decides pass or hold |
-| Release | The default branch deploys to staging, then production, with no human |
-| Govern | Every push records the decision, the reasoning and what CI said |
+Terraform requires AWS credentials and Terraform 1.5+. Build and push the
+container image to the ECR URL from Terraform output, then set
+`infra_risk_image_uri` and apply the stack. The Function URL and scoped GitHub
+OIDC client role are exposed as `decision_api_url` and
+`plan_submitter_role_arn` outputs. Review the IAM trust inputs (`github_org`,
+`github_repo`, `allowed_ref`) before deployment.
+=======
+# infrasec
 
-## Status and limits
 
-| Verified | Not yet verified |
-|---|---|
-| Decision engine, security checks and suggester: 40 passing tests | `.gitlab-ci.yml` end to end on GitLab |
-| Generated Terraform parses as HCL | Generated Terraform through `terraform validate` |
-| The gate and CLI on the demo plans | The Duo flows (tool names are drafts, adjust them in the flow editor) |
 
-- The suggester understands AWS SDK calls in Python and JS/TS, GitHub and GitLab CI, and emits Terraform. Calls made through helper wrappers can be missed.
-- The GitLab pipeline keeps known resource types in `.infrasec/known_types.json`; the AWS Lambda keeps them in DynamoDB.
-- The Lambda does not run `terraform apply` itself; applying is a separate pipeline job.
+## Getting started
+
+To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+
+Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+
+## Add your files
+
+* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
+* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+
+```
+cd existing_repo
+git remote add origin https://gitlab.com/gitlab-ai-hackathon/transcend-october-2026/43740873/infrasec.git
+git branch -M main
+git push -uf origin main
+```
+
+## Integrate with your tools
+
+* [Set up project integrations](https://gitlab.com/gitlab-ai-hackathon/transcend-october-2026/43740873/infrasec/-/settings/integrations)
+
+## Collaborate with your team
+
+* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
+* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
+* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
+* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
+* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+
+## Test and Deploy
+
+Use the built-in continuous integration in GitLab.
+
+* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
+* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
+* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
+* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
+* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+
+***
+
+# Editing this README
+
+When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+
+## Suggestions for a good README
+
+Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+
+## Name
+Choose a self-explaining name for your project.
+
+## Description
+Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+
+## Badges
+On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+
+## Visuals
+Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+
+## Installation
+Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+
+## Usage
+Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+
+## Support
+Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+
+## Roadmap
+If you have ideas for releases in the future, it is a good idea to list them in the README.
+
+## Contributing
+State if you are open to contributions and what your requirements are for accepting them.
+
+For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+
+You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+
+## Authors and acknowledgment
+Show your appreciation to those who have contributed to the project.
 
 ## License
+For open source projects, say how it is licensed.
 
-MIT
+## Project status
+If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.

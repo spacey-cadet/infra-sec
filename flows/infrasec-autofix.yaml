@@ -1,93 +1,102 @@
 # InfraSec auto-fix flow for GitLab Duo Agent Platform (custom flow).
 #
-# Enable it at Automate > Flows and set its trigger to "pipeline failed", so it runs
-# on every held push with no human prompt (hands-off).
+# Triggered by a mention. The `infrasec:notify` CI job posts the InfraSec report on the
+# merge request and mentions this flow, so the loop is hands-off. `context:goal` is then
+# the full text of that comment: the report plus project id, MR iid and branch.
 #
-# DRAFT: component/prompt structure follows GitLab's custom-flow YAML, but toolset
-# names are from memory and could not be validated against your instance. Paste into
-# the flow editor, fix anything it flags (tool names are the likeliest), then run it.
+# Structure and tool names follow GitLab's published custom-flow example. Tools verified
+# there: get_repository_file, list_repository_tree, find_files, blob_search, create_file,
+# create_commit, create_merge_request, create_issue_note. `create_merge_request_note` is
+# NOT in that example; if the session log says it is not found, delete that line and let
+# the agent use create_issue_note or only commit.
+#
+# Merging is NOT done by the agent: GitLab blocks /merge in AI workflows. The
+# `infrasec:automerge` CI job merges tagged fixes after the gate passes.
+#
+# To see what happened: AI > Sessions > latest session > Details.
 version: "v1"
 environment: ambient
 
 components:
-  - name: "explain_hold"
+  - name: "infrasec_agent"
     type: AgentComponent
-    prompt_id: "explain_prompt"
+    prompt_id: "infrasec_prompt"
     inputs:
       - from: "context:goal"
         as: "trigger"
-    toolset:
-      - "get_pipeline_failing_jobs"
-      - "get_job_logs"
-      - "get_repository_file"
-      - "create_merge_request_note"
-      - "create_commit_note"
-
-  - name: "apply_fix"
-    type: AgentComponent
-    prompt_id: "fix_prompt"
-    inputs:
-      - from: "context:explain_hold.final_answer"
-        as: "explanation"
+      - from: "context:project_id"
+        as: "project_id"
     toolset:
       - "get_repository_file"
       - "list_repository_tree"
+      - "find_files"
+      - "blob_search"
       - "create_commit"
       - "create_merge_request_note"
-      - "update_merge_request"
+      - "create_issue_note"
+    ui_log_events:
+      - "on_agent_final_answer"
+      - "on_tool_execution_success"
+      - "on_tool_execution_failed"
 
 prompts:
-  - prompt_id: "explain_prompt"
-    name: "InfraSec explainer"
-    unit_primitives: ["duo_agent_platform"]
+  - name: "InfraSec explainer and remediator"
+    prompt_id: "infrasec_prompt"
+    unit_primitives: []
     prompt_template:
       system: |
-        A pipeline failed. Find the `infrasec:decide` job and read its log, which contains
-        the InfraSec report (also saved as infrasec-report.md / infrasec-decision.json).
-        The decision is made by deterministic code: you must NEVER overrule, re-score or
-        soften it. Post a note on the merge request for this branch (or on the commit if
-        there is no MR) with:
-          1. What was blocked, in one sentence.
-          2. Why InfraSec did not let it pass: each finding code and the exact resource.
-          3. The "value added" line verbatim. If it says CI alone would have shipped the
-             change, say so plainly. If CI was already failing, say the failure is CI's and
-             that you are only adding the diagnosis.
-          4. The fix hint for each finding.
-        Finish with exactly two lines:
-          FIXABLE: yes|no   (yes only if every finding code is one of NETWORK_OPEN_TO_WORLD,
-                             S3_PUBLIC_ACCESS_LOOSENED, DB_PUBLICLY_ACCESSIBLE,
-                             ENCRYPTION_DISABLED, OIDC_TRUST_WIDENED and CI itself did not fail)
-          ATTEMPT: <number from the report>
-      user: "{{trigger}}"
-      placeholder: history
+        You are InfraSec's remediation agent. A deterministic security gate has HELD a
+        Terraform change. The gate's decision is final: you never overrule, re-score or
+        soften it, and you never approve anything.
 
-  - prompt_id: "fix_prompt"
-    name: "InfraSec remediator"
-    unit_primitives: ["duo_agent_platform"]
-    prompt_template:
-      system: |
-        Read the explanation. Then:
-        - If FIXABLE is no, or ATTEMPT is 2 or more: do not commit anything. Post a note saying
-          a human is needed and why, add the label `infrasec::needs-human`, and stop.
-        - Otherwise, edit ONLY the Terraform file that defines each flagged resource and make
-          the smallest change that removes the loosening: restore the narrow CIDR (never
-          0.0.0.0/0 or ::/0), set all four S3 public-access-block flags to true, set
-          publicly_accessible = false, enable encryption, or pin an OIDC `sub` to one repo and
-          ref. Never loosen anything, never touch unrelated resources, never edit IAM
-          permissions, and never change scripts/, agent/, tests/, .gitlab-ci.yml or
-          .infrasec/.
-        - Commit to the branch with the message
-          `fix(infrasec): <one-line summary> [infrasec-autofix]` so the pipeline counts attempts.
-        - Post a note listing the files changed and why, then add `/merge` on its own line so
-          GitLab merges ONLY if the re-run pipeline passes the InfraSec gate.
-      user: "{{explanation}}"
+        The trigger text contains the InfraSec report and a line like
+        "Context: project_id=7, merge_request_iid=12, branch=demo/open-ssh, target_branch=main".
+        Use those values in every tool call. Do not look for other information first.
+
+        STEP 1. Explain. Post a note on that merge request that says, in this order:
+          - What was blocked, in one sentence.
+          - Why it did not pass: each finding code and the exact resource address.
+          - The "Value added" line from the report, verbatim. If it says CI alone would
+            have shipped the change, say so plainly.
+          - The fix hint for each finding.
+        Always do step 1, even if you cannot do step 2.
+
+        STEP 2. Fix, only if EVERY finding code is one of: NETWORK_OPEN_TO_WORLD,
+        S3_PUBLIC_ACCESS_LOOSENED, DB_PUBLICLY_ACCESSIBLE, ENCRYPTION_DISABLED,
+        OIDC_TRUST_WIDENED, AND the report does not say the auto-fix budget is used up.
+          - Find the Terraform file that defines each flagged resource (find_files /
+            blob_search for the resource address).
+          - Read the SAME file on the target_branch from the context (get_repository_file)
+            and restore the EXACT previous value of the loosened setting (for example the
+            original cidr_blocks list). Never invent a replacement value. If the previous
+            value cannot be found, or restoring it would still be 0.0.0.0/0 or ::/0, do
+            not commit: post a note saying a human must choose the value, and stop.
+          - For the other finding types, make the smallest change that removes the
+            loosening: set all four S3 public-access-block flags to true, set
+            publicly_accessible = false, enable encryption, or pin an OIDC `sub` to one
+            repo and ref.
+          - Never loosen anything, never touch unrelated resources, never edit IAM
+            permissions, and never change scripts/, agent/, tests/, .gitlab-ci.yml or
+            .infrasec/.
+          - Commit to the branch from the context with the message
+            `fix(infrasec): <one-line summary> [infrasec-autofix]`.
+          - Post a second note listing the files changed, the exact old and new values,
+            and why. Do NOT use any quick action such as /merge (GitLab rejects it in AI
+            workflows). End the note with: "Merge is handled by the InfraSec CI job once
+            the gate re-run passes."
+
+        If any finding is not in the list above (IAM, new resource type, cost, parse
+        error), or the auto-fix budget is used up: do not commit. Post a note saying a human
+        is needed and why, and stop.
+      user: |
+        {{trigger}}
+
+        project_id: {{project_id}}
       placeholder: history
 
 routers:
-  - from: "explain_hold"
-    to: "apply_fix"
-  - from: "apply_fix"
+  - from: "infrasec_agent"
     to: "end"
 
 flow:
-  entry_point: "explain_hold"
+  entry_point: "infrasec_agent"
