@@ -121,3 +121,27 @@ deploy:production:
   extends: .deploy
   needs: ["infrasec:decide", "deploy:staging"]
   environment: { name: production }
+
+# When the gate (or any job) fails on a branch with an open merge request, post the report
+# and mention the Duo flow. Needs two CI/CD variables: INFRASEC_TOKEN (project access
+# token, api scope, Developer) and INFRASEC_FLOW_HANDLE (the @handle for the flow).
+infrasec:notify:
+  stage: .post
+  image: python:3.12-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_failure
+  script:
+    - python scripts/infrasec_notify.py
+
+# Merges the auto-fix MR once the gate has passed. The agent cannot do this itself
+# (GitLab blocks /merge in AI workflows). Runs only if every earlier job succeeded, and
+# the script itself only merges a head commit tagged [infrasec-autofix].
+infrasec:automerge:
+  stage: .post
+  image: python:3.12-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_success
+  script:
+    - python scripts/infrasec_automerge.py
