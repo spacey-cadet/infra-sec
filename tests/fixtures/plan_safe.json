@@ -1,0 +1,25 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.7.5",
+  "resource_changes": [
+    {
+      "address": "aws_lambda_function.api",
+      "type": "aws_lambda_function",
+      "name": "api",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["update"],
+        "before": {
+          "function_name": "api",
+          "memory_size": 256,
+          "timeout": 10
+        },
+        "after": {
+          "function_name": "api",
+          "memory_size": 512,
+          "timeout": 10
+        }
+      }
+    }
+  ]
+}

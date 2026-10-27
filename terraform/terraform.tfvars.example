@@ -1,0 +1,8 @@
+aws_region          = "us-east-1"
+github_org          = "your-org-or-username"
+github_repo         = "your-infra-repo"
+allowed_ref         = "refs/heads/main"
+project_name        = "terraform-guardian"
+notification_email  = "you@example.com"
+# guardian_image_uri is left blank until the first `docker push` to the
+# ECR repo created by this stack; see README "Bootstrapping" section.

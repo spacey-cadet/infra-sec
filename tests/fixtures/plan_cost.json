@@ -1,0 +1,20 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.7.5",
+  "resource_changes": [
+    {
+      "address": "aws_nat_gateway.main",
+      "type": "aws_nat_gateway",
+      "name": "main",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "subnet_id": "subnet-0abc123",
+          "allocation_id": "eipalloc-0def456"
+        }
+      }
+    }
+  ]
+}
