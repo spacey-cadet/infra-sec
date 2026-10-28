@@ -1,55 +1,75 @@
 # InfraSec
 
-> License: MIT (see [LICENSE](LICENSE)). Built on GitLab CI, NVIDIA Nemotron and Nebius Token Factory.
+> **License:** MIT, see [LICENSE](LICENSE). **Stack:** deterministic Python gate, GitLab CI, AWS Lambda decision API, NVIDIA Nemotron on Nebius Token Factory.
 
-**AI explains and fixes. A deterministic gate decides.**
+**AI does the work. Deterministic code decides. A human approves what reaches production.**
 
-InfraSec reviews Terraform changes before they ship. A plain-Python scorer rates every change and returns `auto_apply` or `hold`. When a change is held, GitLab Duo agents explain why in plain language, commit a safe fix to the branch, and a CI job merges it only after the gate re-run passes. Anything the agent cannot fix safely goes to a human.
+InfraSec reviews Terraform changes before they ship. A plain-Python evaluator reads the Terraform plan and returns `auto_apply` or `hold`. When a change is held, an NVIDIA Nemotron model served on Nebius Token Factory explains it on the merge request in plain language: what changed, why it was held, and how to roll it back. The model never produces the verdict, and production deploys are a manual job.
 
-The principle: **let AI explain and fix, but never let it invent the risk number.** Decisions are reproducible and auditable because the score never comes from a model.
+## What it does
 
-## How it works
+1. **Gate (deterministic).** `scripts/infrasec_decide.py` scores `terraform show -json` output with no AWS account and no network. It also records whether conventional CI (`terraform fmt`/`validate`, tests) passed, and the report says whether CI alone would have shipped the change.
+2. **Explain (Nemotron on Token Factory).** If the gate holds a branch, `infrasec:explain` runs `scripts/infrasec_explain.py`. It sends the decision JSON and the Terraform diff to Nemotron and posts a three-part note (what changed, why it was held, rollback plan) on the open merge request.
+3. **Notify and fix (optional, GitLab Duo).** `infrasec:notify` posts the report and mentions a GitLab Duo flow (`flows/infrasec-autofix.yaml`) that can commit a narrow fix. This needs GitLab Duo Agent Platform and is not required for the Nemotron step. See [Optional: GitLab Duo auto-fix](#optional-gitlab-duo-auto-fix).
+4. **Human approval.** `deploy:staging` runs after the gate passes on the default branch. `deploy:production` is a **manual** job and waits for a person to start it.
 
 ```mermaid
 flowchart LR
     A[Push to branch] --> B[Plan + CI checks]
-    B --> C{InfraSec gate}
-    C -- auto_apply --> D[Deploy]
-    C -- hold --> E[infrasec:notify posts report on MR]
-    E --> F[Duo flow: explain]
-    F --> G{Every finding auto-fixable?}
-    G -- yes --> H[Commit fix tagged infrasec-autofix]
-    G -- no --> I[Human needed]
-    H --> J[Gate re-runs on new commit]
-    J -- passes --> K[infrasec:automerge merges]
-    J -- holds --> I
+    B --> C{InfraSec gate<br/>deterministic}
+    C -- hold --> D[Nemotron explains<br/>on the MR]
+    C -- hold --> E[Optional: Duo auto-fix]
+    C -- auto_apply, default branch --> F[Deploy staging]
+    F --> G[Human starts<br/>deploy:production]
 ```
 
-1. **Gate (deterministic).** `scripts/infrasec_decide.py` scores the Terraform plan and also records whether conventional CI (`terraform fmt/validate`, tests) passed. The report includes a "Value added" line saying whether CI alone would have shipped the change.
-2. **Notify.** If the gate holds a branch that has an open merge request, `scripts/infrasec_notify.py` posts the report on the MR and mentions the Duo flow. The comment carries the context the agent needs: project, MR number, source branch and target branch.
-3. **Explain and fix (agent).** The flow in `flows/infrasec-autofix.yaml` always posts an explanation: what was blocked, each finding code with its exact resource address, and the fix hint. It then fixes only if every finding is one of `NETWORK_OPEN_TO_WORLD`, `S3_PUBLIC_ACCESS_LOOSENED`, `DB_PUBLICLY_ACCESSIBLE`, `ENCRYPTION_DISABLED` or `OIDC_TRUST_WIDENED`, and the auto-fix budget is not used up. It reads the file on the target branch and restores the exact previous value instead of guessing. It commits with a message ending in `[infrasec-autofix]`.
-4. **Merge (CI, not the agent).** GitLab does not allow the `/merge` quick action in AI workflows, so `scripts/infrasec_automerge.py` does it after the gate passes.
-
-### Guardrails
-
-- The agent never overrules, re-scores or softens the gate, and never approves anything.
-- It never edits IAM permissions, `scripts/`, `agent/`, `tests/`, `.gitlab-ci.yml` or `.infrasec/`.
-- Auto-merge happens only when all of these hold: every earlier job succeeded, the pipeline's commit is the MR's current head, that commit is tagged `[infrasec-autofix]`, and the MR is not a draft and has no conflicts. The merge request pins the head SHA, so a later push cancels it.
-- Findings the agent cannot fix (IAM, new resource types, cost, parse errors) stop for a human, with a note explaining why.
-- Repeated auto-fix attempts are capped: the gate counts recent `[infrasec-autofix]` commits.
+The principle: **never let a model invent the risk number.** Decisions are reproducible and auditable because the score never comes from a model.
 
 ## How this project uses NVIDIA Nemotron and Nebius Token Factory
 
-When the deterministic gate returns `hold`, `scripts/infrasec_explain.py` sends the decision JSON and the Terraform diff to an NVIDIA Nemotron model served on Nebius Token Factory (OpenAI-compatible API, `https://api.tokenfactory.nebius.com/v1`). The model writes a short "what changed / why it was held / rollback plan" note that is posted on the merge request.
+`scripts/infrasec_explain.py` calls Nebius Token Factory through its OpenAI-compatible API (`https://api.tokenfactory.nebius.com/v1`) with a Nemotron model chosen by `NEBIUS_MODEL_ID`. It uses only the Python standard library, so there is no SDK to install.
 
-The model never decides. The verdict comes from the deterministic evaluator, the prompt forbids changing or re-scoring it, and the step is advisory: if Token Factory is unreachable or no key is set, the pipeline carries on unchanged. Production deploys are a manual job, so a human approves what reaches production.
+- **Advisory only.** The system prompt forbids re-scoring or questioning the verdict, which comes from the evaluator. The script exits `0` in every case: with no key set, no model set, or Token Factory unreachable it prints a message and the pipeline carries on unchanged.
+- **Grounded input.** The prompt contains only the decision JSON and the `.tf` diff (both truncated to a fixed size), and asks for exactly three short sections.
+- **Reasoning output stripped.** Any `<think>...</think>` block is removed before the note is posted.
+- **Output.** The note is printed in the job log and posted on the merge request, headed "Explanation by NVIDIA Nemotron on Nebius Token Factory (advisory only)".
 
-Setup:
+Environment variables:
 
-1. Create an API key in Nebius Token Factory.
-2. List Nemotron model ids: `NEBIUS_API_KEY=... python scripts/infrasec_explain.py --list-models`
-3. Add CI/CD variables `NEBIUS_API_KEY` (masked), `NEBIUS_MODEL_ID` and `INFRASEC_TOKEN`.
-4. Open a merge request that opens SSH to `0.0.0.0/0`; the `infrasec:explain` job posts the Nemotron note.
+| Variable | Purpose |
+|---|---|
+| `NEBIUS_API_KEY` | Token Factory API key (masked CI/CD variable) |
+| `NEBIUS_MODEL_ID` | Nemotron model id from the Token Factory catalog |
+| `NEBIUS_BASE_URL` | Optional, defaults to `https://api.tokenfactory.nebius.com/v1` |
+| `INFRASEC_TOKEN` | Project access token (`api` scope) used to post the MR note |
+
+Pick a model id:
+
+```bash
+NEBIUS_API_KEY=... python scripts/infrasec_explain.py --list-models
+```
+
+## Try the demo
+
+The demo target is `demo-target/main.tf`, which defines `aws_security_group.app` with SSH open to `10.0.0.0/8`. The provider is configured to plan offline, so **no AWS credentials are needed**.
+
+**Locally, with a saved plan:**
+
+```bash
+pip install -r requirements.txt pytest
+python scripts/infrasec_decide.py --plan demo/plans/ssh_open.json --ci-status pass
+# exit code 2 = held; writes infrasec-decision.json and infrasec-report.md
+NEBIUS_API_KEY=... NEBIUS_MODEL_ID=... python scripts/infrasec_explain.py --decision infrasec-decision.json
+```
+
+Saved plans: `demo/plans/ssh_open.json` (held), `demo/plans/s3_public.json` (held), `demo/plans/safe.json` (passes).
+
+**On GitLab:**
+
+1. Add CI/CD variables `NEBIUS_API_KEY` (masked), `NEBIUS_MODEL_ID` and `INFRASEC_TOKEN` (project access token, `api` scope, Developer role).
+2. Create a branch from `main`, change the SSH `cidr_blocks` in `demo-target/main.tf` to `["0.0.0.0/0"]`, push it and open a merge request.
+3. `infrasec:decide` fails and holds the change. `infrasec:explain` posts the Nemotron note on the merge request.
+4. Without `AWS_ACCESS_KEY_ID`, the deploy jobs print `DEMO MODE` and apply nothing.
 
 ## Decision rules
 
@@ -64,69 +84,57 @@ The plain Python evaluator is authoritative and fail-closed:
 | Parse error or unknown action                       | Hold                   |
 | No escalation rule triggered                        | Auto-apply             |
 
-Fastino's open-weight GLiNER2.5-Decide checkpoint is available as an optional pipeline-side advisory classifier. Its output is attached to the API response but does not change the deterministic action. This keeps the model useful for review context without giving a text classifier authority over infrastructure security policy. See the [model documentation](https://github.com/fastino-ai/GLiNER2#-available-models).
+Findings also carry codes such as `NETWORK_OPEN_TO_WORLD`, `S3_PUBLIC_ACCESS_LOOSENED`, `DB_PUBLICLY_ACCESSIBLE`, `ENCRYPTION_DISABLED` and `OIDC_TRUST_WIDENED`.
 
-## Try the demo on GitLab
+Fastino's open-weight GLiNER2.5-Decide checkpoint is available as an optional advisory classifier. Its output is attached to the API response but never changes the deterministic action. See the [model documentation](https://github.com/fastino-ai/GLiNER2#-available-models).
 
-The demo target is `demo-target/main.tf`, which defines `aws_security_group.app`.
+## Optional: GitLab Duo auto-fix
 
-1. Create a branch from `main` that changes the SSH ingress `cidr_blocks` to `0.0.0.0/0`, push it and open a merge request.
-2. The pipeline runs. `infrasec:decide` fails and the MR is held.
-3. `infrasec:notify` comments on the MR and mentions the flow. The agent replies with the explanation and commits the original CIDR back, tagged `[infrasec-autofix]`.
-4. The pipeline re-runs on the new commit, the gate passes, and `infrasec:automerge` merges.
+Built for the GitLab AI Hackathon and kept here as an optional extra. It needs GitLab Duo Agent Platform and two CI/CD variables.
 
-No AWS credentials are needed. Without `AWS_ACCESS_KEY_ID` the deploy jobs print `DEMO MODE` and apply nothing.
+- `flows/infrasec-autofix.yaml` (paste into Automate > Flows) explains a held change and, only when every finding is auto-fixable and the attempt budget is not used up, commits the previous value back, tagged `[infrasec-autofix]`.
+- `scripts/infrasec_automerge.py` merges that fix after the gate re-run passes. It only merges a head commit tagged `[infrasec-autofix]`, and only when the merge request is not a draft and has no conflicts.
+- Guardrails: the agent never edits IAM permissions, `scripts/`, `agent/`, `tests/`, `.gitlab-ci.yml` or `.infrasec/`, and attempts are capped.
+- Variables: `INFRASEC_TOKEN` and `INFRASEC_FLOW_HANDLE` (the `@handle` GitLab autocompletes for the flow).
 
-### GitLab setup
+Auto-merge into the default branch is automatic for these tagged fixes. Reaching production still requires a person to start `deploy:production`.
 
-| What | Where |
-|------|-------|
-| `flows/infrasec-autofix.yaml` | Paste into Automate > Flows > your flow > Edit |
-| `INFRASEC_TOKEN` | CI/CD variable: project access token, `api` scope, Developer role (must be allowed to merge into `main`) |
-| `INFRASEC_FLOW_HANDLE` | CI/CD variable: the `@handle` GitLab autocompletes for the flow |
-| `DEMO_PLAN` (optional) | Path to a saved plan under `demo/plans/` to skip `terraform plan` |
+## Decision API (AWS)
 
-## Use in a GitHub repository
+The same evaluator is deployed as an IAM-authenticated AWS Lambda Function URL. `POST` a JSON object containing `repo`, `head_sha` and `plan_json`; requests are signed with AWS SigV4. The `infra-risk` CLI exits `0` for `auto_apply`, `2` for `hold`, and nonzero on request or credential errors. CI should treat all nonzero exits as blocked. The endpoint is not publicly callable, so the demo above uses the offline gate instead.
 
-Copy [`examples/infra-risk.yml`](examples/infra-risk.yml) to `.github/workflows/infra-risk.yml`, set repository variables `INFRA_RISK_CLIENT_ROLE_ARN` and `INFRA_RISK_API_URL`, then replace the sample Git URL with this repository's canonical URL. The action assumes the scoped AWS role through GitHub OIDC, creates a Terraform plan and submits it to the decision API.
-
-To use GLiNER locally in the CI runner:
+To use it from another repository, copy [`examples/infra-risk.yml`](examples/infra-risk.yml) to `.github/workflows/infra-risk.yml` and set repository variables `INFRA_RISK_CLIENT_ROLE_ARN` and `INFRA_RISK_API_URL`. To add the optional GLiNER classifier on the runner:
 
 ```bash
-pip install 'infra-risk[gliner] @ git+https://github.com/YOUR_ORG/infra-risk.git'
+pip install 'infra-risk[gliner] @ git+https://github.com/spacey-cadet/infra-sec.git'
 export INFRA_RISK_GLINER_MODEL=fastino/GLiNER2.5-Decide
 infra-risk --plan plan.json
 ```
 
-The default package is smaller: `pip install 'infra-risk[aws] ...'` installs only the AWS signing client. The GLiNER extra downloads PyTorch dependencies and the model weights on the runner.
+The default package is smaller: `pip install 'infra-risk[aws] ...'` installs only the AWS signing client.
 
-## Decision API
-
-`POST` a JSON object containing `repo`, `head_sha` and `plan_json` to the Lambda Function URL. Requests are signed with AWS SigV4 and the endpoint requires AWS IAM authorization.
-
-The Python CLI exits `0` for `auto_apply`, `2` for `hold`, and nonzero on request or credential errors. CI should treat all nonzero exits as blocked.
+Deploying the API needs AWS credentials and Terraform 1.5+. Build and push the container image to the ECR URL from Terraform output, set `infra_risk_image_uri` and apply `terraform/`. Review the IAM trust inputs (`github_org`, `github_repo`, `allowed_ref`) before deployment.
 
 ## Repository map
 
-- `agent/plan_parser.py`, `agent/oidc_diff.py`, `agent/cost_estimate.py`, `agent/decision_engine.py`: deterministic plan analysis.
-- `agent/handler.py`: synchronous Function URL API and Lambda entry point.
-- `infra_risk/`: small installable pipeline client (`infra-risk` command).
-- `flows/infrasec-autofix.yaml`: the GitLab Duo flow that explains and fixes held changes.
-- `scripts/infrasec_decide.py`, `scripts/infrasec_notify.py`, `scripts/infrasec_automerge.py`: the gate, the MR notification and the guarded merge.
-- `.gitlab-ci.yml`: pipeline wiring for the loop above.
+- `agent/`: deterministic plan analysis (`plan_parser.py`, `oidc_diff.py`, `cost_estimate.py`, `decision_engine.py`) and the Lambda entry point `handler.py`.
+- `scripts/infrasec_decide.py`: the offline gate. `scripts/infrasec_explain.py`: the Nemotron explanation. `scripts/infrasec_notify.py` and `scripts/infrasec_automerge.py`: the optional Duo loop.
+- `infra_risk/`: installable pipeline client (`infra-risk` command).
+- `.gitlab-ci.yml`: pipeline wiring. `flows/`: GitLab Duo flows.
 - `demo-target/`: the Terraform the demo changes. `demo/plans/`: saved plans.
 - `terraform/`: Lambda, IAM OIDC access, decision history and notifications.
-- `docs/workflow.md`: API and pipeline integration details.
-- `tests/`: parser, OIDC diff, decision matrix, notify and auto-merge coverage.
+- `docs/`: `workflow.md` (API and pipeline details), `decision_engine.md`, `NEBIUS_SUBMISSION.md`.
+- `tests/`: parser, OIDC diff, decision matrix, notify, auto-merge and explain coverage. The explain tests use a local fake server, so no key is needed.
 
 ```bash
 pip install -r requirements.txt pytest
 python -m pytest tests -q
 ```
 
-## Deploy the decision API
+## Hackathon history
 
-Terraform requires AWS credentials and Terraform 1.5+. Build and push the container image to the ECR URL from Terraform output, then set `infra_risk_image_uri` and apply the stack. The Function URL and scoped GitHub OIDC client role are exposed as the `decision_api_url` and `plan_submitter_role_arn` outputs. Review the IAM trust inputs (`github_org`, `github_repo`, `allowed_ref`) before deployment.
+- **GitLab AI Hackathon (submitted, frozen):** the deterministic gate, the Duo explain-and-fix loop, the suggester and the AWS decision API. Autonomy level: Supervised.
+- **Nebius x NVIDIA Global AI Hackathon (this repository):** new in this period are the Nemotron explanation on Nebius Token Factory (`scripts/infrasec_explain.py`, its tests and the `infrasec:explain` job), a manual `deploy:production` gate, and this README. The evaluator itself is unchanged by design.
 
 ## License
 
