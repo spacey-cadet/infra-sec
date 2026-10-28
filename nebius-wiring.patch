@@ -1,0 +1,705 @@
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+index 7884038..9a43642 100644
+--- a/.gitlab-ci.yml
++++ b/.gitlab-ci.yml
+@@ -1,4 +1,4 @@
+-# InfraSec: hands-off infrastructure security gate on GitLab.
++# InfraSec: supervised infrastructure security gate on GitLab (production deploy is manual).
+ #
+ # Every push runs the pipeline. If the plan is safe it deploys; if InfraSec holds it
+ # the pipeline fails, and the Duo flow (flows/infrasec-autofix.yaml) explains why,
+@@ -121,6 +121,10 @@ deploy:production:
+   extends: .deploy
+   needs: ["infrasec:decide", "deploy:staging"]
+   environment: { name: production }
++  rules:
++    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
++      when: manual
++      allow_failure: false
+ 
+ # When the gate (or any job) fails on a branch with an open merge request, post the report
+ # and mention the Duo flow. Needs two CI/CD variables: INFRASEC_TOKEN (project access
+@@ -145,3 +149,41 @@ infrasec:automerge:
+       when: on_success
+   script:
+     - python scripts/infrasec_automerge.py
++
++# Advisory explanation by NVIDIA Nemotron on Nebius Token Factory. Never changes the
++# verdict and never fails the pipeline. Needs NEBIUS_API_KEY (masked) and NEBIUS_MODEL_ID.
++infrasec:explain:
++  stage: .post
++  image: python:3.12-slim
++  rules:
++    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
++      when: on_failure
++  allow_failure: true
++  before_script:
++    - apt-get update -qq && apt-get install -y -qq git >/dev/null
++    - git fetch --depth 50 origin "$CI_DEFAULT_BRANCH" || true
++  script:
++    - python scripts/infrasec_explain.py --decision infrasec-decision.json
++
++# Nemotron proposes a fix; the deterministic gate must re-approve it before it is kept.
++# Commits carry the [infrasec-autofix] tag, so the attempt cap and infrasec:automerge apply.
++# Needs NEBIUS_API_KEY, NEBIUS_MODEL_ID and INFRASEC_TOKEN (api + write_repository).
++infrasec:fix:
++  stage: .post
++  image:
++    name: hashicorp/terraform:1.9
++    entrypoint: [""]
++  rules:
++    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
++      when: on_failure
++  allow_failure: true
++  before_script:
++    - apk add --no-cache python3 git >/dev/null
++    - git fetch --depth 50 origin "$CI_DEFAULT_BRANCH" || true
++  script:
++    - python3 scripts/infrasec_fix.py --decision infrasec-decision.json --tf "$TF_DIR/main.tf" --commit
++    - |
++      if [ "$(git rev-parse HEAD)" != "$CI_COMMIT_SHA" ] && [ -n "$INFRASEC_TOKEN" ]; then
++        git push "https://oauth2:${INFRASEC_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:refs/heads/${CI_COMMIT_REF_NAME}"
++      fi
++
+diff --git a/README.md b/README.md
+index d74432a..d4b2da8 100644
+--- a/README.md
++++ b/README.md
+@@ -1,40 +1,88 @@
+ # InfraSec
+ 
+-**AI explains and fixes. A deterministic gate decides.**
++> **License:** MIT, see [LICENSE](LICENSE). **Stack:** deterministic Python gate, GitLab CI, AWS Lambda decision API, NVIDIA Nemotron on Nebius Token Factory.
+ 
+-InfraSec reviews Terraform changes before they ship. A plain-Python scorer rates every change and returns `auto_apply` or `hold`. When a change is held, GitLab Duo agents explain why in plain language, commit a safe fix to the branch, and a CI job merges it only after the gate re-run passes. Anything the agent cannot fix safely goes to a human.
++**AI does the work. Deterministic code decides. A human approves what reaches production.**
+ 
+-The principle: **let AI explain and fix, but never let it invent the risk number.** Decisions are reproducible and auditable because the score never comes from a model.
++InfraSec reviews Terraform changes before they ship. A plain-Python evaluator reads the Terraform plan and returns `auto_apply` or `hold`. When a change is held, an NVIDIA Nemotron model served on Nebius Token Factory explains it on the merge request in plain language, then proposes a small Terraform fix. The deterministic gate re-checks the fix and it is kept only if the gate now says `auto_apply`. The model never produces the verdict, and production deploys are a manual job.
+ 
+-## How it works
++## What it does
++
++1. **Gate (deterministic).** `scripts/infrasec_decide.py` scores `terraform show -json` output with no AWS account and no network. It also records whether conventional CI (`terraform fmt`/`validate`, tests) passed, and the report says whether CI alone would have shipped the change.
++2. **Explain (Nemotron on Token Factory).** If the gate holds a branch, `infrasec:explain` runs `scripts/infrasec_explain.py`. It sends the decision JSON and the Terraform diff to Nemotron and posts a three-part note (what changed, why it was held, rollback plan) on the open merge request.
++3. **Fix (Nemotron on Token Factory, verified by the gate).** If every finding is auto-fixable (a pure tightening such as `NETWORK_OPEN_TO_WORLD`) and the attempt budget is not used up, `infrasec:fix` runs `scripts/infrasec_fix.py`. Nemotron returns the corrected `.tf` file; the script applies it, regenerates the plan, and re-runs the gate. Kept and committed (tagged `[infrasec-autofix]`) only if the gate returns `auto_apply`; otherwise it is reverted and the MR note says a human is needed.
++4. **Human approval.** `deploy:staging` runs after the gate passes on the default branch. `deploy:production` is a **manual** job and waits for a person to start it.
+ 
+ ```mermaid
+ flowchart LR
+     A[Push to branch] --> B[Plan + CI checks]
+-    B --> C{InfraSec gate}
+-    C -- auto_apply --> D[Deploy]
+-    C -- hold --> E[infrasec:notify posts report on MR]
+-    E --> F[Duo flow: explain]
+-    F --> G{Every finding auto-fixable?}
+-    G -- yes --> H[Commit fix tagged infrasec-autofix]
+-    G -- no --> I[Human needed]
+-    H --> J[Gate re-runs on new commit]
+-    J -- passes --> K[infrasec:automerge merges]
+-    J -- holds --> I
++    B --> C{InfraSec gate<br/>deterministic}
++    C -- hold --> D[Nemotron explains<br/>on the MR]
++    C -- hold --> E[Nemotron proposes fix]
++    E --> H{Gate re-checks<br/>patched plan}
++    H -- auto_apply --> I[Commit to MR branch]
++    H -- still hold --> J[Revert, ask a human]
++    C -- auto_apply, default branch --> F[Deploy staging]
++    F --> G[Human starts<br/>deploy:production]
++```
++
++The principle: **never let a model invent the risk number.** Decisions are reproducible and auditable because the score never comes from a model.
++
++## How this project uses NVIDIA Nemotron and Nebius Token Factory
++
++Two scripts call Nebius Token Factory through its OpenAI-compatible API (`https://api.tokenfactory.nebius.com/v1`) with a Nemotron model chosen by `NEBIUS_MODEL_ID`. Both use only the Python standard library, so there is no SDK to install.
++
++**Explain: `scripts/infrasec_explain.py`**
++
++- **Advisory only.** The system prompt forbids re-scoring or questioning the verdict, which comes from the evaluator. The script exits `0` in every case: with no key set, no model set, or Token Factory unreachable it prints a message and the pipeline carries on unchanged.
++- **Grounded input.** The prompt contains only the decision JSON and the `.tf` diff (both truncated to a fixed size), and asks for exactly three short sections.
++- **Reasoning output stripped.** Any `<think>...</think>` block is removed before the note is posted.
++- **Output.** The note is printed in the job log and posted on the merge request, headed "Explanation by NVIDIA Nemotron on Nebius Token Factory (advisory only)".
++
++**Fix: `scripts/infrasec_fix.py`**
++
++- **Only pure tightenings.** It runs only when every finding is in the auto-fixable set (open-to-world networking, public S3/DB, disabled encryption, widened OIDC trust). IAM, new resource types, cost and parse errors always go to a human, and the model is not even called.
++- **Guardrails before anything is written.** One existing `.tf` file only, at most 10 changed lines, and the set of resources must be identical (no adding, removing or renaming). The model also sees the previous version from the target branch so it can restore the exact old value.
++- **The gate has the final say.** The patched file is formatted, planned and re-evaluated by the same deterministic evaluator. Anything other than `auto_apply` reverts the file.
++- **Bounded and quiet.** The attempt budget is shared with the rest of the loop, a failure or timeout changes nothing, and the script always exits `0`.
++- **Not a rubber stamp.** The gate only checks the signals listed under [Decision rules](#decision-rules). Keeping the diff small and the resources fixed limits what a bad proposal can do, and a person still starts `deploy:production`.
++
++Environment variables:
++
++| Variable | Purpose |
++|---|---|
++| `NEBIUS_API_KEY` | Token Factory API key (masked CI/CD variable) |
++| `NEBIUS_MODEL_ID` | Nemotron model id from the Token Factory catalog |
++| `NEBIUS_BASE_URL` | Optional, defaults to `https://api.tokenfactory.nebius.com/v1` |
++| `INFRASEC_TOKEN` | Project access token (`api` and `write_repository`, Developer role) used to post MR notes and push the fix |
++
++Pick a model id:
++
++```bash
++NEBIUS_API_KEY=... python scripts/infrasec_explain.py --list-models
++```
++
++## Try the demo
++
++The demo target is `demo-target/main.tf`, which defines `aws_security_group.app` with SSH open to `10.0.0.0/8`. The provider is configured to plan offline, so **no AWS credentials are needed**.
++
++**Locally, with a saved plan:**
++
++```bash
++pip install -r requirements.txt pytest
++python scripts/infrasec_decide.py --plan demo/plans/ssh_open.json --ci-status pass
++# exit code 2 = held; writes infrasec-decision.json and infrasec-report.md
++NEBIUS_API_KEY=... NEBIUS_MODEL_ID=... python scripts/infrasec_explain.py --decision infrasec-decision.json
+ ```
+ 
+-1. **Gate (deterministic).** `scripts/infrasec_decide.py` scores the Terraform plan and also records whether conventional CI (`terraform fmt/validate`, tests) passed. The report includes a "Value added" line saying whether CI alone would have shipped the change.
+-2. **Notify.** If the gate holds a branch that has an open merge request, `scripts/infrasec_notify.py` posts the report on the MR and mentions the Duo flow. The comment carries the context the agent needs: project, MR number, source branch and target branch.
+-3. **Explain and fix (agent).** The flow in `flows/infrasec-autofix.yaml` always posts an explanation: what was blocked, each finding code with its exact resource address, and the fix hint. It then fixes only if every finding is one of `NETWORK_OPEN_TO_WORLD`, `S3_PUBLIC_ACCESS_LOOSENED`, `DB_PUBLICLY_ACCESSIBLE`, `ENCRYPTION_DISABLED` or `OIDC_TRUST_WIDENED`, and the auto-fix budget is not used up. It reads the file on the target branch and restores the exact previous value instead of guessing. It commits with a message ending in `[infrasec-autofix]`.
+-4. **Merge (CI, not the agent).** GitLab does not allow the `/merge` quick action in AI workflows, so `scripts/infrasec_automerge.py` does it after the gate passes.
++Saved plans: `demo/plans/ssh_open.json` (held), `demo/plans/s3_public.json` (held), `demo/plans/safe.json` (passes).
+ 
+-### Guardrails
++**On GitLab:**
+ 
+-- The agent never overrules, re-scores or softens the gate, and never approves anything.
+-- It never edits IAM permissions, `scripts/`, `agent/`, `tests/`, `.gitlab-ci.yml` or `.infrasec/`.
+-- Auto-merge happens only when all of these hold: every earlier job succeeded, the pipeline's commit is the MR's current head, that commit is tagged `[infrasec-autofix]`, and the MR is not a draft and has no conflicts. The merge request pins the head SHA, so a later push cancels it.
+-- Findings the agent cannot fix (IAM, new resource types, cost, parse errors) stop for a human, with a note explaining why.
+-- Repeated auto-fix attempts are capped: the gate counts recent `[infrasec-autofix]` commits.
++1. Add CI/CD variables `NEBIUS_API_KEY` (masked), `NEBIUS_MODEL_ID` and `INFRASEC_TOKEN` (project access token, `api` + `write_repository`, Developer role).
++2. Create a branch from `main`, change the SSH `cidr_blocks` in `demo-target/main.tf` to `["0.0.0.0/0"]`, push it and open a merge request.
++3. `infrasec:decide` fails and holds the change. `infrasec:explain` posts the Nemotron note, and `infrasec:fix` asks Nemotron for the fix. If the gate approves the patched file, it is committed back to the branch, the pipeline re-runs and passes, and `infrasec:automerge` merges the merge request. Production still waits for a person.
++4. Without `AWS_ACCESS_KEY_ID`, the deploy jobs print `DEMO MODE` and apply nothing.
+ 
+ ## Decision rules
+ 
+@@ -49,70 +97,58 @@ The plain Python evaluator is authoritative and fail-closed:
+ | Parse error or unknown action                       | Hold                   |
+ | No escalation rule triggered                        | Auto-apply             |
+ 
+-Fastino's open-weight GLiNER2.5-Decide checkpoint is available as an optional pipeline-side advisory classifier. Its output is attached to the API response but does not change the deterministic action. This keeps the model useful for review context without giving a text classifier authority over infrastructure security policy. See the [model documentation](https://github.com/fastino-ai/GLiNER2#-available-models).
++Findings also carry codes such as `NETWORK_OPEN_TO_WORLD`, `S3_PUBLIC_ACCESS_LOOSENED`, `DB_PUBLICLY_ACCESSIBLE`, `ENCRYPTION_DISABLED` and `OIDC_TRUST_WIDENED`.
+ 
+-## Try the demo on GitLab
++Fastino's open-weight GLiNER2.5-Decide checkpoint is available as an optional advisory classifier. Its output is attached to the API response but never changes the deterministic action. See the [model documentation](https://github.com/fastino-ai/GLiNER2#-available-models).
+ 
+-The demo target is `demo-target/main.tf`, which defines `aws_security_group.app`.
++## Alternative: GitLab Duo auto-fix
+ 
+-1. Create a branch from `main` that changes the SSH ingress `cidr_blocks` to `0.0.0.0/0`, push it and open a merge request.
+-2. The pipeline runs. `infrasec:decide` fails and the MR is held.
+-3. `infrasec:notify` comments on the MR and mentions the flow. The agent replies with the explanation and commits the original CIDR back, tagged `[infrasec-autofix]`.
+-4. The pipeline re-runs on the new commit, the gate passes, and `infrasec:automerge` merges.
++Built for the GitLab AI Hackathon and kept as an alternative to the Nemotron fix. It needs GitLab Duo Agent Platform and two CI/CD variables. Use one fixer or the other: leave `INFRASEC_FLOW_HANDLE` unset when `infrasec:fix` is your fixer, because `infrasec:notify` only mentions the Duo flow when that variable is set.
+ 
+-No AWS credentials are needed. Without `AWS_ACCESS_KEY_ID` the deploy jobs print `DEMO MODE` and apply nothing.
++- `flows/infrasec-autofix.yaml` (paste into Automate > Flows) explains a held change and, only when every finding is auto-fixable and the attempt budget is not used up, commits the previous value back, tagged `[infrasec-autofix]`.
++- `scripts/infrasec_automerge.py` merges that fix after the gate re-run passes. It only merges a head commit tagged `[infrasec-autofix]`, and only when the merge request is not a draft and has no conflicts.
++- Guardrails: the agent never edits IAM permissions, `scripts/`, `agent/`, `tests/`, `.gitlab-ci.yml` or `.infrasec/`, and attempts are capped.
++- Variables: `INFRASEC_TOKEN` and `INFRASEC_FLOW_HANDLE` (the `@handle` GitLab autocompletes for the flow).
+ 
+-### GitLab setup
++Auto-merge into the default branch is automatic for these tagged fixes. Reaching production still requires a person to start `deploy:production`.
+ 
+-| What | Where |
+-|------|-------|
+-| `flows/infrasec-autofix.yaml` | Paste into Automate > Flows > your flow > Edit |
+-| `INFRASEC_TOKEN` | CI/CD variable: project access token, `api` scope, Developer role (must be allowed to merge into `main`) |
+-| `INFRASEC_FLOW_HANDLE` | CI/CD variable: the `@handle` GitLab autocompletes for the flow |
+-| `DEMO_PLAN` (optional) | Path to a saved plan under `demo/plans/` to skip `terraform plan` |
++## Decision API (AWS)
+ 
+-## Use in a GitHub repository
++The same evaluator is deployed as an IAM-authenticated AWS Lambda Function URL. `POST` a JSON object containing `repo`, `head_sha` and `plan_json`; requests are signed with AWS SigV4. The `infra-risk` CLI exits `0` for `auto_apply`, `2` for `hold`, and nonzero on request or credential errors. CI should treat all nonzero exits as blocked. The endpoint is not publicly callable, so the demo above uses the offline gate instead.
+ 
+-Copy [`examples/infra-risk.yml`](examples/infra-risk.yml) to `.github/workflows/infra-risk.yml`, set repository variables `INFRA_RISK_CLIENT_ROLE_ARN` and `INFRA_RISK_API_URL`, then replace the sample Git URL with this repository's canonical URL. The action assumes the scoped AWS role through GitHub OIDC, creates a Terraform plan and submits it to the decision API.
+-
+-To use GLiNER locally in the CI runner:
++To use it from another repository, copy [`examples/infra-risk.yml`](examples/infra-risk.yml) to `.github/workflows/infra-risk.yml` and set repository variables `INFRA_RISK_CLIENT_ROLE_ARN` and `INFRA_RISK_API_URL`. To add the optional GLiNER classifier on the runner:
+ 
+ ```bash
+-pip install 'infra-risk[gliner] @ git+https://github.com/YOUR_ORG/infra-risk.git'
++pip install 'infra-risk[gliner] @ git+https://github.com/spacey-cadet/infra-sec.git'
+ export INFRA_RISK_GLINER_MODEL=fastino/GLiNER2.5-Decide
+ infra-risk --plan plan.json
+ ```
+ 
+-The default package is smaller: `pip install 'infra-risk[aws] ...'` installs only the AWS signing client. The GLiNER extra downloads PyTorch dependencies and the model weights on the runner.
+-
+-## Decision API
+-
+-`POST` a JSON object containing `repo`, `head_sha` and `plan_json` to the Lambda Function URL. Requests are signed with AWS SigV4 and the endpoint requires AWS IAM authorization.
++The default package is smaller: `pip install 'infra-risk[aws] ...'` installs only the AWS signing client.
+ 
+-The Python CLI exits `0` for `auto_apply`, `2` for `hold`, and nonzero on request or credential errors. CI should treat all nonzero exits as blocked.
++Deploying the API needs AWS credentials and Terraform 1.5+. Build and push the container image to the ECR URL from Terraform output, set `infra_risk_image_uri` and apply `terraform/`. Review the IAM trust inputs (`github_org`, `github_repo`, `allowed_ref`) before deployment.
+ 
+ ## Repository map
+ 
+-- `agent/plan_parser.py`, `agent/oidc_diff.py`, `agent/cost_estimate.py`, `agent/decision_engine.py`: deterministic plan analysis.
+-- `agent/handler.py`: synchronous Function URL API and Lambda entry point.
+-- `infra_risk/`: small installable pipeline client (`infra-risk` command).
+-- `flows/infrasec-autofix.yaml`: the GitLab Duo flow that explains and fixes held changes.
+-- `scripts/infrasec_decide.py`, `scripts/infrasec_notify.py`, `scripts/infrasec_automerge.py`: the gate, the MR notification and the guarded merge.
+-- `.gitlab-ci.yml`: pipeline wiring for the loop above.
++- `agent/`: deterministic plan analysis (`plan_parser.py`, `oidc_diff.py`, `cost_estimate.py`, `decision_engine.py`) and the Lambda entry point `handler.py`.
++- `scripts/infrasec_decide.py`: the offline gate. `scripts/infrasec_explain.py`: the Nemotron explanation. `scripts/infrasec_fix.py`: the Nemotron fix, re-checked by the gate. `scripts/infrasec_notify.py` and `scripts/infrasec_automerge.py`: notification and merging of tagged fixes (the Duo flow is an alternative).
++- `infra_risk/`: installable pipeline client (`infra-risk` command).
++- `.gitlab-ci.yml`: pipeline wiring. `flows/`: GitLab Duo flows.
+ - `demo-target/`: the Terraform the demo changes. `demo/plans/`: saved plans.
+ - `terraform/`: Lambda, IAM OIDC access, decision history and notifications.
+-- `docs/workflow.md`: API and pipeline integration details.
+-- `tests/`: parser, OIDC diff, decision matrix, notify and auto-merge coverage.
++- `docs/`: `workflow.md` (API and pipeline details), `decision_engine.md`, `NEBIUS_SUBMISSION.md`.
++- `tests/`: parser, OIDC diff, decision matrix, notify, auto-merge, explain and fix coverage. The explain and fix tests use a local fake server, so no key is needed; the fix tests include a bad proposal, an oversized diff and a changed resource set, all of which must leave the file untouched.
+ 
+ ```bash
+ pip install -r requirements.txt pytest
+ python -m pytest tests -q
+ ```
+ 
+-## Deploy the decision API
++## Hackathon history
+ 
+-Terraform requires AWS credentials and Terraform 1.5+. Build and push the container image to the ECR URL from Terraform output, then set `infra_risk_image_uri` and apply the stack. The Function URL and scoped GitHub OIDC client role are exposed as the `decision_api_url` and `plan_submitter_role_arn` outputs. Review the IAM trust inputs (`github_org`, `github_repo`, `allowed_ref`) before deployment.
++- **GitLab AI Hackathon (submitted, frozen):** the deterministic gate, the Duo explain-and-fix loop, the suggester and the AWS decision API. Autonomy level: Supervised.
++- **Nebius x NVIDIA Global AI Hackathon (this repository):** new in this period are the Nemotron explanation and the Nemotron-proposed, gate-verified fix on Nebius Token Factory (`scripts/infrasec_explain.py`, `scripts/infrasec_fix.py`, their tests and the `infrasec:explain` and `infrasec:fix` jobs), a manual `deploy:production` gate, and this README. The evaluator itself is unchanged by design.
+ 
+ ## License
+ 
+-MIT. See [LICENSE](LICENSE).
+\ No newline at end of file
++MIT. See [LICENSE](LICENSE).
+diff --git a/ci/nebius-explain-job.yml b/ci/nebius-explain-job.yml
+index c9fa834..38f8ece 100644
+--- a/ci/nebius-explain-job.yml
++++ b/ci/nebius-explain-job.yml
+@@ -1,15 +1,3 @@
+-# Add this job to .gitlab-ci.yml. It reuses the stage, rules, image and needs
+-# of your existing infrasec:notify job, so it fires in the same situations
+-# (an MR where the gate returned hold).
+-#
+-# 1. Replace decision.json with the file your infrasec:decide job saves as an
+-#    artifact (check its `artifacts:` block).
+-# 2. Make sure infrasec:decide lists that file under artifacts: paths, and that
+-#    this job can see it (via `needs` with artifacts: true in your notify job).
+-# 3. Add CI/CD variables: NEBIUS_API_KEY (masked) and NEBIUS_MODEL_ID.
+-
+-infrasec:explain:
+-  extends: infrasec:notify
+-  script:
+-    - python scripts/infrasec_explain.py --decision decision.json
+-  allow_failure: true
++# The active job now lives in .gitlab-ci.yml as `infrasec:explain`.
++# Variables to set (CI/CD settings): NEBIUS_API_KEY (masked), NEBIUS_MODEL_ID,
++# INFRASEC_TOKEN (to post the note on the merge request).
+diff --git a/scripts/infrasec_explain.py b/scripts/infrasec_explain.py
+index 126f407..141719f 100644
+--- a/scripts/infrasec_explain.py
++++ b/scripts/infrasec_explain.py
+@@ -24,6 +24,7 @@ import re
+ import subprocess
+ import sys
+ import urllib.error
++import urllib.parse
+ import urllib.request
+ 
+ DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
+@@ -96,6 +97,12 @@ def post_note(body):
+     project = os.environ.get("CI_PROJECT_ID")
+     iid = os.environ.get("CI_MERGE_REQUEST_IID")
+     token = os.environ.get("INFRASEC_TOKEN")
++    if api and project and token and not iid:
++        # Branch pipelines have no CI_MERGE_REQUEST_IID: find the open MR by branch.
++        branch = urllib.parse.quote(os.environ.get("CI_COMMIT_REF_NAME", ""), safe="")
++        mrs = _request(f"{api}/projects/{project}/merge_requests?state=opened&source_branch={branch}",
++                       {"PRIVATE-TOKEN": token})
++        iid = str(mrs[0]["iid"]) if mrs else None
+     if not (api and project and iid and token):
+         print("No merge request context or token; printing only.")
+         return False
+diff --git a/scripts/infrasec_fix.py b/scripts/infrasec_fix.py
+new file mode 100644
+index 0000000..456ddcf
+--- /dev/null
++++ b/scripts/infrasec_fix.py
+@@ -0,0 +1,216 @@
++#!/usr/bin/env python3
++"""Nemotron proposes a Terraform fix; the deterministic gate must agree before it is kept.
++
++Flow (only for a held change whose findings are ALL auto-fixable):
++  1. Ask an NVIDIA Nemotron model on Nebius Token Factory for the corrected .tf file.
++  2. Guardrails: .tf file only, small diff, same set of resources.
++  3. Write the file, regenerate the plan, re-run the deterministic evaluator.
++  4. Gate says auto_apply -> keep (and commit with --commit). Otherwise revert.
++
++The model never decides. A bad, unsafe or unusable proposal is simply discarded.
++Never fails the pipeline: exits 0 in every case and prints what happened.
++
++Environment:
++  NEBIUS_API_KEY, NEBIUS_MODEL_ID, optional NEBIUS_BASE_URL
++  INFRASEC_RECHECK_CMD   optional shell command that regenerates the plan and runs the
++                         gate (exit 0 = auto_apply). Default: terraform fmt/init/plan/show,
++                         then scripts/infrasec_decide.py.
++  INFRASEC_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, CI_COMMIT_REF_NAME   post an MR note (optional)
++
++Usage:
++  infrasec_fix.py --decision infrasec-decision.json --tf demo-target/main.tf [--commit]
++"""
++from __future__ import annotations
++
++import argparse
++import difflib
++import json
++import os
++import re
++import shlex
++import subprocess
++import sys
++import tempfile
++import urllib.error
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++sys.path.insert(0, str(HERE.parent))
++
++import infrasec_explain as ex  # noqa: E402
++from agent.fix_hints import AUTO_FIXABLE, FIX_HINTS  # noqa: E402
++from infrasec_decide import MAX_AUTOFIX_ATTEMPTS  # noqa: E402
++
++MAX_CHANGED_LINES = 10
++MAX_FILE_CHARS = 20000
++TAG = "[infrasec-autofix]"
++
++SYSTEM_PROMPT = (
++    "You fix Terraform security findings. A deterministic evaluator has ALREADY decided the "
++    "change must be held; you must not argue with it. Return ONLY the complete corrected "
++    "contents of the file: no prose, no explanation, no code fences. Change as little as "
++    "possible, fix only the listed findings, and never add, remove or rename resources. "
++    "If a previous version of the file is provided, restore the exact previous value for "
++    "the loosened setting instead of guessing a new one."
++)
++
++
++def build_messages(decision: dict, tf_path: str, current: str, base: str | None) -> list[dict]:
++    findings = []
++    for f in decision.get("risk_flags", []):
++        findings.append(f"- {f['code']}: {f['message']}\n  Hint: {FIX_HINTS.get(f['code'], '')}")
++    user = "Findings to fix:\n" + "\n".join(findings) + f"\n\nCurrent file {tf_path}:\n{current}"
++    if base:
++        user += f"\n\nPrevious version of the file on the target branch:\n{base}"
++    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
++
++
++def extract_file(text: str) -> str:
++    text = ex.strip_reasoning(text)
++    m = re.search(r"```(?:hcl|terraform|tf)?\n(.*?)```", text, flags=re.DOTALL)
++    if m:
++        text = m.group(1)
++    return text.strip("\n") + "\n"
++
++
++def resource_set(text: str) -> set[tuple[str, str]]:
++    return set(re.findall(r'^\s*resource\s+"([^"]+)"\s+"([^"]+)"', text, flags=re.M))
++
++
++def changed_lines(a: str, b: str) -> int:
++    diff = difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0)
++    return sum(1 for ln in diff if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
++
++
++def propose(base_url: str, api_key: str, model: str, messages: list[dict]) -> str | None:
++    url = base_url.rstrip("/") + "/chat/completions"
++    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
++    body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4000}
++    try:
++        data = ex._request(url, headers, body, timeout=90)
++        return extract_file(data["choices"][0]["message"]["content"] or "")
++    except (urllib.error.URLError, KeyError, ValueError, OSError) as exc:
++        print(f"Model call failed: {type(exc).__name__}: {exc}")
++        return None
++
++
++def base_version(path: Path, ref: str) -> str | None:
++    try:
++        out = subprocess.run(["git", "show", f"{ref}:{path.as_posix()}"], capture_output=True,
++                             text=True, timeout=30)
++        return out.stdout if out.returncode == 0 and out.stdout else None
++    except Exception:
++        return None
++
++
++def gate_passes(tf: Path, attempt: int) -> bool:
++    """Regenerate the plan from the patched file and re-run the deterministic gate."""
++    override = os.environ.get("INFRASEC_RECHECK_CMD")
++    if override:
++        return subprocess.run(override, shell=True).returncode == 0
++    with tempfile.TemporaryDirectory() as out:
++        plan = f"{out}/plan.fixed.json"
++        d, f = shlex.quote(str(tf.parent)), shlex.quote(tf.name)
++        steps = (f"cd {d} && terraform fmt {f} >/dev/null && "
++                 "terraform init -input=false -backend=false >/dev/null && "
++                 f"terraform plan -input=false -out=tfplan.fixed >/dev/null && "
++                 f"terraform show -json tfplan.fixed > {shlex.quote(plan)}; rc=$?; rm -f tfplan.fixed; exit $rc")
++        if subprocess.run(steps, shell=True).returncode != 0:
++            print("Could not regenerate the plan from the proposed file.")
++            return False
++        rc = subprocess.run([sys.executable, str(HERE / "infrasec_decide.py"), "--plan", plan,
++                             "--ci-status", "pass", "--attempt", str(attempt), "--out-dir", out],
++                            capture_output=True, text=True).returncode
++        return rc == 0
++
++
++def commit(tf: Path) -> None:
++    cfg = ["-c", "user.name=infrasec-bot", "-c", "user.email=infrasec-bot@users.noreply.gitlab.com"]
++    subprocess.run(["git", "add", str(tf)], check=True)
++    subprocess.run(["git", *cfg, "commit", "-m",
++                    f"infrasec: Nemotron-proposed fix, verified by the gate {TAG}"], check=True)
++
++
++def note(body: str) -> None:
++    text = ("**Fix proposed by NVIDIA Nemotron on Nebius Token Factory** "
++            "(the deterministic gate re-checks every proposal)\n\n" + body)
++    print(text)
++    try:
++        ex.post_note(text)
++    except (urllib.error.URLError, KeyError, ValueError, OSError) as exc:
++        print(f"Could not post the MR note: {exc}")
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--decision", required=True)
++    ap.add_argument("--tf", required=True, help="the .tf file to fix")
++    ap.add_argument("--base-ref", default=f"origin/{os.environ.get('CI_DEFAULT_BRANCH', 'main')}")
++    ap.add_argument("--commit", action="store_true", help="git commit the verified fix")
++    args = ap.parse_args(argv)
++
++    api_key, model = os.environ.get("NEBIUS_API_KEY"), os.environ.get("NEBIUS_MODEL_ID")
++    base_url = os.environ.get("NEBIUS_BASE_URL", ex.DEFAULT_BASE_URL)
++    if not (api_key and model):
++        print("NEBIUS_API_KEY or NEBIUS_MODEL_ID not set; skipping the fix.")
++        return 0
++    if not os.path.exists(args.decision):
++        print("Decision file not found; skipping the fix.")
++        return 0
++    decision = json.loads(Path(args.decision).read_text(encoding="utf-8"))
++    if decision.get("action") != "hold":
++        print("Gate did not hold this change; nothing to fix.")
++        return 0
++
++    codes = [f["code"] for f in decision.get("risk_flags", [])]
++    blockers = [c for c in codes if c not in AUTO_FIXABLE]
++    if not codes or blockers:
++        note("Not attempted: " + (", ".join(f"`{c}`" for c in blockers) or "no findings")
++             + " need a human reviewer. Nemotron only proposes fixes for pure tightenings.")
++        return 0
++    attempt = int(decision.get("attempt", 0))
++    if attempt >= MAX_AUTOFIX_ATTEMPTS:
++        note(f"Not attempted: the auto-fix budget ({MAX_AUTOFIX_ATTEMPTS}) is used up. Escalated to a human.")
++        return 0
++
++    tf = Path(args.tf)
++    if tf.suffix != ".tf" or not tf.is_file():
++        print(f"Refusing: {args.tf} is not an existing .tf file.")
++        return 0
++    original = tf.read_text(encoding="utf-8")
++    if len(original) > MAX_FILE_CHARS:
++        print("Refusing: file too large for a safe proposal.")
++        return 0
++
++    fixed = propose(base_url, api_key, model,
++                    build_messages(decision, args.tf, original, base_version(tf, args.base_ref)))
++    if fixed is None:
++        return 0
++    if fixed == original:
++        note("Rejected: the proposal changed nothing.")
++        return 0
++    if resource_set(fixed) != resource_set(original):
++        note("Rejected: the proposal added, removed or renamed a resource.")
++        return 0
++    n = changed_lines(original, fixed)
++    if n > MAX_CHANGED_LINES:
++        note(f"Rejected: the proposal changed {n} lines (limit {MAX_CHANGED_LINES}).")
++        return 0
++
++    tf.write_text(fixed, encoding="utf-8")
++    if not gate_passes(tf, attempt):
++        tf.write_text(original, encoding="utf-8")
++        note("Rejected: the deterministic gate still holds the patched file, so nothing was changed. "
++             "A human needs to fix this one.")
++        return 0
++
++    if args.commit:
++        commit(tf)
++    note(f"Kept: the gate returns `auto_apply` on the patched file ({n} lines changed in `{args.tf}`)."
++         + (" Committed." if args.commit else ""))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/test_fix.py b/tests/test_fix.py
+new file mode 100644
+index 0000000..3dd0ef4
+--- /dev/null
++++ b/tests/test_fix.py
+@@ -0,0 +1,152 @@
++import json
++import os
++import subprocess
++import sys
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
++import infrasec_fix as fx  # noqa: E402
++
++BAD = 'resource "aws_security_group" "app" {\n  ingress {\n    cidr_blocks = ["0.0.0.0/0"]\n  }\n}\n'
++GOOD = 'resource "aws_security_group" "app" {\n  ingress {\n    cidr_blocks = ["10.0.0.0/8"]\n  }\n}\n'
++HOLD = {"action": "hold", "attempt": 0,
++        "risk_flags": [{"code": "NETWORK_OPEN_TO_WORLD", "message": "ssh open", "severity": "critical"}]}
++
++
++class _Fake(BaseHTTPRequestHandler):
++    reply = GOOD
++    calls = 0
++
++    def do_POST(self):
++        n = int(self.headers.get("Content-Length", 0))
++        self.rfile.read(n)
++        _Fake.calls += 1
++        body = json.dumps({"choices": [{"message": {"content": _Fake.reply}}]}).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *a):
++        pass
++
++
++@pytest.fixture
++def env(monkeypatch, tmp_path):
++    srv = HTTPServer(("127.0.0.1", 0), _Fake)
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    monkeypatch.setenv("NEBIUS_API_KEY", "k")
++    monkeypatch.setenv("NEBIUS_MODEL_ID", "nvidia/test")
++    monkeypatch.setenv("NEBIUS_BASE_URL", f"http://127.0.0.1:{srv.server_port}/v1")
++    for k in ("INFRASEC_TOKEN", "CI_API_V4_URL", "CI_PROJECT_ID"):
++        monkeypatch.delenv(k, raising=False)
++    monkeypatch.chdir(tmp_path)
++    _Fake.reply, _Fake.calls = GOOD, 0
++    (tmp_path / "main.tf").write_text(BAD)
++    (tmp_path / "d.json").write_text(json.dumps(HOLD))
++    subprocess.run(["git", "init", "-q"], check=True)
++    subprocess.run(["git", "add", "main.tf"], check=True)
++    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], check=True)
++    return tmp_path
++
++
++def run(*extra):
++    return fx.main(["--decision", "d.json", "--tf", "main.tf", *extra])
++
++
++def test_good_fix_is_kept_and_committed(env, monkeypatch):
++    monkeypatch.setenv("INFRASEC_RECHECK_CMD", "true")
++    assert run("--commit") == 0
++    assert "10.0.0.0/8" in (env / "main.tf").read_text()
++    msg = subprocess.run(["git", "log", "-1", "--format=%B"], capture_output=True, text=True).stdout
++    assert "[infrasec-autofix]" in msg
++
++
++def test_gate_still_holds_reverts(env, monkeypatch):
++    monkeypatch.setenv("INFRASEC_RECHECK_CMD", "false")
++    run("--commit")
++    assert (env / "main.tf").read_text() == BAD
++    assert subprocess.run(["git", "status", "--short", "main.tf"], capture_output=True, text=True).stdout == ""
++
++
++def test_code_fences_and_think_are_stripped(env, monkeypatch):
++    monkeypatch.setenv("INFRASEC_RECHECK_CMD", "true")
++    _Fake.reply = "<think>hmm</think>\n```hcl\n" + GOOD + "```"
++    run()
++    assert (env / "main.tf").read_text() == GOOD
++
++
++def test_non_tf_file_refused(env):
++    (env / "main.py").write_text("x")
++    assert fx.main(["--decision", "d.json", "--tf", "main.py"]) == 0
++    assert _Fake.calls == 0
++
++
++def test_oversized_diff_rejected(env, monkeypatch):
++    monkeypatch.setenv("INFRASEC_RECHECK_CMD", "true")
++    _Fake.reply = GOOD + "".join(f"# line {i}\n" for i in range(30))
++    run()
++    assert (env / "main.tf").read_text() == BAD
++
++
++def test_resource_set_change_rejected(env, monkeypatch):
++    monkeypatch.setenv("INFRASEC_RECHECK_CMD", "true")
++    _Fake.reply = GOOD.replace('"app"', '"other"')
++    run()
++    assert (env / "main.tf").read_text() == BAD
++
++
++def test_non_fixable_finding_never_calls_model(env):
++    (env / "d.json").write_text(json.dumps({**HOLD, "risk_flags": [
++        {"code": "IAM_RESOURCE_TOUCHED", "message": "iam", "severity": "high"}]}))
++    run()
++    assert _Fake.calls == 0 and (env / "main.tf").read_text() == BAD
++
++
++def test_attempt_budget_blocks(env):
++    (env / "d.json").write_text(json.dumps({**HOLD, "attempt": 2}))
++    run()
++    assert _Fake.calls == 0
++
++
++def test_auto_apply_decision_skipped(env):
++    (env / "d.json").write_text(json.dumps({"action": "auto_apply", "risk_flags": []}))
++    run()
++    assert _Fake.calls == 0
++
++
++def test_skips_without_key(env, monkeypatch, capsys):
++    monkeypatch.delenv("NEBIUS_API_KEY")
++    assert run() == 0
++    assert "skipping" in capsys.readouterr().out and _Fake.calls == 0
++
++
++def test_default_recheck_runs_terraform_then_the_real_gate(env, monkeypatch):
++    """No INFRASEC_RECHECK_CMD: stand-in `terraform` emits a saved plan, the real gate judges it."""
++    import shutil
++    repo = os.path.join(os.path.dirname(__file__), "..")
++    shutil.copytree(os.path.join(repo, ".infrasec"), env / ".infrasec")
++    bindir = env / "bin"
++    bindir.mkdir()
++    for name, plan in (("safe", "safe.json"), ("held", "ssh_open.json")):
++        shim = bindir / f"terraform_{name}"
++        shim.write_text('#!/bin/sh\nif [ "$1" = show ]; then cat "%s"; fi\nexit 0\n'
++                        % os.path.abspath(os.path.join(repo, "demo", "plans", plan)))
++        shim.chmod(0o755)
++    monkeypatch.delenv("INFRASEC_RECHECK_CMD", raising=False)
++
++    for name, expect_kept in (("safe", True), ("held", False)):
++        (env / "main.tf").write_text(BAD)
++        tfbin = env / "bin2"
++        tfbin.mkdir(exist_ok=True)
++        link = tfbin / "terraform"
++        if link.exists():
++            link.unlink()
++        link.symlink_to(bindir / f"terraform_{name}")
++        monkeypatch.setenv("PATH", f"{tfbin}:{os.environ['PATH']}")
++        run()
++        assert ("10.0.0.0/8" in (env / "main.tf").read_text()) is expect_kept

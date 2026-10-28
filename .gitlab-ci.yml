@@ -164,3 +164,26 @@ infrasec:explain:
     - git fetch --depth 50 origin "$CI_DEFAULT_BRANCH" || true
   script:
     - python scripts/infrasec_explain.py --decision infrasec-decision.json
+
+# Nemotron proposes a fix; the deterministic gate must re-approve it before it is kept.
+# Commits carry the [infrasec-autofix] tag, so the attempt cap and infrasec:automerge apply.
+# Needs NEBIUS_API_KEY, NEBIUS_MODEL_ID and INFRASEC_TOKEN (api + write_repository).
+infrasec:fix:
+  stage: .post
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_failure
+  allow_failure: true
+  before_script:
+    - apk add --no-cache python3 git >/dev/null
+    - git fetch --depth 50 origin "$CI_DEFAULT_BRANCH" || true
+  script:
+    - python3 scripts/infrasec_fix.py --decision infrasec-decision.json --tf "$TF_DIR/main.tf" --commit
+    - |
+      if [ "$(git rev-parse HEAD)" != "$CI_COMMIT_SHA" ] && [ -n "$INFRASEC_TOKEN" ]; then
+        git push "https://oauth2:${INFRASEC_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:refs/heads/${CI_COMMIT_REF_NAME}"
+      fi
+
