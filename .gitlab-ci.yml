@@ -1,4 +1,4 @@
-# InfraSec: hands-off infrastructure security gate on GitLab.
+# InfraSec: supervised infrastructure security gate on GitLab (production deploy is manual).
 #
 # Every push runs the pipeline. If the plan is safe it deploys; if InfraSec holds it
 # the pipeline fails, and the Duo flow (flows/infrasec-autofix.yaml) explains why,
@@ -121,6 +121,10 @@ deploy:production:
   extends: .deploy
   needs: ["infrasec:decide", "deploy:staging"]
   environment: { name: production }
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
 
 # When the gate (or any job) fails on a branch with an open merge request, post the report
 # and mention the Duo flow. Needs two CI/CD variables: INFRASEC_TOKEN (project access
@@ -145,3 +149,18 @@ infrasec:automerge:
       when: on_success
   script:
     - python scripts/infrasec_automerge.py
+
+# Advisory explanation by NVIDIA Nemotron on Nebius Token Factory. Never changes the
+# verdict and never fails the pipeline. Needs NEBIUS_API_KEY (masked) and NEBIUS_MODEL_ID.
+infrasec:explain:
+  stage: .post
+  image: python:3.12-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_failure
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+    - git fetch --depth 50 origin "$CI_DEFAULT_BRANCH" || true
+  script:
+    - python scripts/infrasec_explain.py --decision infrasec-decision.json

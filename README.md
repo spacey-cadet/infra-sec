@@ -1,5 +1,7 @@
 # InfraSec
 
+> License: MIT (see [LICENSE](LICENSE)). Built on GitLab CI, NVIDIA Nemotron and Nebius Token Factory.
+
 **AI explains and fixes. A deterministic gate decides.**
 
 InfraSec reviews Terraform changes before they ship. A plain-Python scorer rates every change and returns `auto_apply` or `hold`. When a change is held, GitLab Duo agents explain why in plain language, commit a safe fix to the branch, and a CI job merges it only after the gate re-run passes. Anything the agent cannot fix safely goes to a human.
@@ -35,6 +37,19 @@ flowchart LR
 - Auto-merge happens only when all of these hold: every earlier job succeeded, the pipeline's commit is the MR's current head, that commit is tagged `[infrasec-autofix]`, and the MR is not a draft and has no conflicts. The merge request pins the head SHA, so a later push cancels it.
 - Findings the agent cannot fix (IAM, new resource types, cost, parse errors) stop for a human, with a note explaining why.
 - Repeated auto-fix attempts are capped: the gate counts recent `[infrasec-autofix]` commits.
+
+## How this project uses NVIDIA Nemotron and Nebius Token Factory
+
+When the deterministic gate returns `hold`, `scripts/infrasec_explain.py` sends the decision JSON and the Terraform diff to an NVIDIA Nemotron model served on Nebius Token Factory (OpenAI-compatible API, `https://api.tokenfactory.nebius.com/v1`). The model writes a short "what changed / why it was held / rollback plan" note that is posted on the merge request.
+
+The model never decides. The verdict comes from the deterministic evaluator, the prompt forbids changing or re-scoring it, and the step is advisory: if Token Factory is unreachable or no key is set, the pipeline carries on unchanged. Production deploys are a manual job, so a human approves what reaches production.
+
+Setup:
+
+1. Create an API key in Nebius Token Factory.
+2. List Nemotron model ids: `NEBIUS_API_KEY=... python scripts/infrasec_explain.py --list-models`
+3. Add CI/CD variables `NEBIUS_API_KEY` (masked), `NEBIUS_MODEL_ID` and `INFRASEC_TOKEN`.
+4. Open a merge request that opens SSH to `0.0.0.0/0`; the `infrasec:explain` job posts the Nemotron note.
 
 ## Decision rules
 

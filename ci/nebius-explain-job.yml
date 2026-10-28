@@ -1,15 +1,3 @@
-# Add this job to .gitlab-ci.yml. It reuses the stage, rules, image and needs
-# of your existing infrasec:notify job, so it fires in the same situations
-# (an MR where the gate returned hold).
-#
-# 1. Replace decision.json with the file your infrasec:decide job saves as an
-#    artifact (check its `artifacts:` block).
-# 2. Make sure infrasec:decide lists that file under artifacts: paths, and that
-#    this job can see it (via `needs` with artifacts: true in your notify job).
-# 3. Add CI/CD variables: NEBIUS_API_KEY (masked) and NEBIUS_MODEL_ID.
-
-infrasec:explain:
-  extends: infrasec:notify
-  script:
-    - python scripts/infrasec_explain.py --decision decision.json
-  allow_failure: true
+# The active job now lives in .gitlab-ci.yml as `infrasec:explain`.
+# Variables to set (CI/CD settings): NEBIUS_API_KEY (masked), NEBIUS_MODEL_ID,
+# INFRASEC_TOKEN (to post the note on the merge request).

@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
@@ -96,6 +97,12 @@ def post_note(body):
     project = os.environ.get("CI_PROJECT_ID")
     iid = os.environ.get("CI_MERGE_REQUEST_IID")
     token = os.environ.get("INFRASEC_TOKEN")
+    if api and project and token and not iid:
+        # Branch pipelines have no CI_MERGE_REQUEST_IID: find the open MR by branch.
+        branch = urllib.parse.quote(os.environ.get("CI_COMMIT_REF_NAME", ""), safe="")
+        mrs = _request(f"{api}/projects/{project}/merge_requests?state=opened&source_branch={branch}",
+                       {"PRIVATE-TOKEN": token})
+        iid = str(mrs[0]["iid"]) if mrs else None
     if not (api and project and iid and token):
         print("No merge request context or token; printing only.")
         return False
