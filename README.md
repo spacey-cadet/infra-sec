@@ -149,10 +149,9 @@ python -m pytest tests -q
 - **GitLab AI Hackathon (submitted, frozen):** the deterministic gate, the Duo explain-and-fix loop, the suggester and the AWS decision API. Autonomy level: Supervised.
 - **Nebius x NVIDIA Global AI Hackathon (this repository):** new in this period are the Nemotron explanation and the Nemotron-proposed, gate-verified fix on Nebius Token Factory (`scripts/infrasec_explain.py`, `scripts/infrasec_fix.py`, their tests and the `infrasec:explain` and `infrasec:fix` jobs), a manual `deploy:production` gate, and this README. The evaluator itself is unchanged by design.
 
-## License
-
 ## XERJ Corpus Hub
 XERJ is  an open-source, AI-native search engine that it gives coding agents the exact passage of code or documentation they need instead of letting them guess from memory. 
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/spacey-cadet/badge.svg)](https://hub.xerj.org/contributors/spacey-cadet)
 
+## License
 MIT. See [LICENSE](LICENSE).
