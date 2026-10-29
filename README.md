@@ -151,4 +151,8 @@ python -m pytest tests -q
 
 ## License
 
+## XERJ Corpus Hub
+XERJ is  an open-source, AI-native search engine that it gives coding agents the exact passage of code or documentation they need instead of letting them guess from memory. 
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/spacey-cadet/badge.svg)](https://hub.xerj.org/contributors/spacey-cadet)
+
 MIT. See [LICENSE](LICENSE).
