@@ -1,16 +1,21 @@
 # InfraSec
 
-> **License:** MIT, see [LICENSE](LICENSE). **Stack:** deterministic Python gate, GitLab CI, AWS Lambda decision API, NVIDIA Nemotron on Nebius Token Factory.
+> **License:** MIT, see [LICENSE](LICENSE). **Stack:** deterministic Python gate, GitLab CI, AWS Lambda decision API, NVIDIA Nemotron via an OpenAI-compatible endpoint, built for Nebius Token Factory.
+
+> **Run status:** The demo was recorded against NVIDIA-hosted Nemotron, not Nebius
+> Token Factory, because I could not complete Nebius account verification before the
+> deadline. The integration targets Token Factory and switches by changing
+> `NEBIUS_API_KEY`, `NEBIUS_MODEL_ID` and `NEBIUS_BASE_URL`. Tests use a local fake server.
 
 **AI does the work. Deterministic code decides. A human approves what reaches production.**
 
-InfraSec reviews Terraform changes before they ship. A plain-Python evaluator reads the Terraform plan and returns `auto_apply` or `hold`. When a change is held, an NVIDIA Nemotron model served on Nebius Token Factory explains it on the merge request in plain language, then proposes a small Terraform fix. The deterministic gate re-checks the fix and it is kept only if the gate now says `auto_apply`. The model never produces the verdict, and production deploys are a manual job.
+InfraSec reviews Terraform changes before they ship. A plain-Python evaluator reads the Terraform plan and returns `auto_apply` or `hold`. When a change is held, an NVIDIA Nemotron model behind an OpenAI-compatible endpoint (Nebius Token Factory by default) explains it on the merge request in plain language, then proposes a small Terraform fix. The deterministic gate re-checks the fix and it is kept only if the gate now says `auto_apply`. The model never produces the verdict, and production deploys are a manual job.
 
 ## What it does
 
 1. **Gate (deterministic).** `scripts/infrasec_decide.py` scores `terraform show -json` output with no AWS account and no network. It also records whether conventional CI (`terraform fmt`/`validate`, tests) passed, and the report says whether CI alone would have shipped the change.
-2. **Explain (Nemotron on Token Factory).** If the gate holds a branch, `infrasec:explain` runs `scripts/infrasec_explain.py`. It sends the decision JSON and the Terraform diff to Nemotron and posts a three-part note (what changed, why it was held, rollback plan) on the open merge request.
-3. **Fix (Nemotron on Token Factory, verified by the gate).** If every finding is auto-fixable (a pure tightening such as `NETWORK_OPEN_TO_WORLD`) and the attempt budget is not used up, `infrasec:fix` runs `scripts/infrasec_fix.py`. Nemotron returns the corrected `.tf` file; the script applies it, regenerates the plan, and re-runs the gate. Kept and committed (tagged `[infrasec-autofix]`) only if the gate returns `auto_apply`; otherwise it is reverted and the MR note says a human is needed.
+2. **Explain (Nemotron, Token Factory endpoint by default).** If the gate holds a branch, `infrasec:explain` runs `scripts/infrasec_explain.py`. It sends the decision JSON and the Terraform diff to Nemotron and posts a three-part note (what changed, why it was held, rollback plan) on the open merge request.
+3. **Fix (Nemotron, verified by the gate).** If every finding is auto-fixable (a pure tightening such as `NETWORK_OPEN_TO_WORLD`) and the attempt budget is not used up, `infrasec:fix` runs `scripts/infrasec_fix.py`. Nemotron returns the corrected `.tf` file; the script applies it, regenerates the plan, and re-runs the gate. Kept and committed (tagged `[infrasec-autofix]`) only if the gate returns `auto_apply`; otherwise it is reverted and the MR note says a human is needed.
 4. **Human approval.** `deploy:staging` runs after the gate passes on the default branch. `deploy:production` is a **manual** job and waits for a person to start it.
 
 ```mermaid
@@ -30,14 +35,14 @@ The principle: **never let a model invent the risk number.** Decisions are repro
 
 ## How this project uses NVIDIA Nemotron and Nebius Token Factory
 
-Two scripts call Nebius Token Factory through its OpenAI-compatible API (`https://api.tokenfactory.nebius.com/v1`) with a Nemotron model chosen by `NEBIUS_MODEL_ID`. Both use only the Python standard library, so there is no SDK to install.
+Two scripts call an OpenAI-compatible endpoint (Nebius Token Factory by default, `https://api.tokenfactory.nebius.com/v1`) with a Nemotron model chosen by `NEBIUS_MODEL_ID`. Both use only the Python standard library, so there is no SDK to install.
 
 **Explain: `scripts/infrasec_explain.py`**
 
 - **Advisory only.** The system prompt forbids re-scoring or questioning the verdict, which comes from the evaluator. The script exits `0` in every case: with no key set, no model set, or Token Factory unreachable it prints a message and the pipeline carries on unchanged.
 - **Grounded input.** The prompt contains only the decision JSON and the `.tf` diff (both truncated to a fixed size), and asks for exactly three short sections.
 - **Reasoning output stripped.** Any `<think>...</think>` block is removed before the note is posted.
-- **Output.** The note is printed in the job log and posted on the merge request, headed "Explanation by NVIDIA Nemotron on Nebius Token Factory (advisory only)".
+- **Output.** The note is printed in the job log and posted on the merge request, headed "Explanation by NVIDIA Nemotron on <provider> (advisory only)". The provider name is derived from `NEBIUS_BASE_URL`, so a non-Nebius run is labelled as such.
 
 **Fix: `scripts/infrasec_fix.py`**
 
@@ -55,6 +60,16 @@ Environment variables:
 | `NEBIUS_MODEL_ID` | Nemotron model id from the Token Factory catalog |
 | `NEBIUS_BASE_URL` | Optional, defaults to `https://api.tokenfactory.nebius.com/v1` |
 | `INFRASEC_TOKEN` | Project access token (`api` and `write_repository`, Developer role) used to post MR notes and push the fix |
+
+**Using another endpoint**
+
+Any OpenAI-compatible endpoint works. For NVIDIA-hosted Nemotron:
+
+```bash
+export NEBIUS_API_KEY=nvapi-...
+export NEBIUS_BASE_URL=https://integrate.api.nvidia.com/v1
+python scripts/infrasec_explain.py --list-models
+```
 
 Pick a model id:
 
@@ -147,7 +162,7 @@ python -m pytest tests -q
 ## Hackathon history
 
 - **GitLab AI Hackathon (submitted, frozen):** the deterministic gate, the Duo explain-and-fix loop, the suggester and the AWS decision API. Autonomy level: Supervised.
-- **Nebius x NVIDIA Global AI Hackathon (this repository):** new in this period are the Nemotron explanation and the Nemotron-proposed, gate-verified fix on Nebius Token Factory (`scripts/infrasec_explain.py`, `scripts/infrasec_fix.py`, their tests and the `infrasec:explain` and `infrasec:fix` jobs), a manual `deploy:production` gate, and this README. The evaluator itself is unchanged by design.
+- **Nebius x NVIDIA Global AI Hackathon (this repository):** new in this period are the Nemotron explanation and the Nemotron-proposed, gate-verified fix via an OpenAI-compatible endpoint, Nebius Token Factory by default (`scripts/infrasec_explain.py`, `scripts/infrasec_fix.py`, their tests and the `infrasec:explain` and `infrasec:fix` jobs), a manual `deploy:production` gate, and this README. The evaluator itself is unchanged by design.
 
 ## XERJ Corpus Hub
 XERJ is  an open-source, AI-native search engine that it gives coding agents the exact passage of code or documentation they need instead of letting them guess from memory. 

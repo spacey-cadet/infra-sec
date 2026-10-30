@@ -150,8 +150,9 @@ infrasec:automerge:
   script:
     - python scripts/infrasec_automerge.py
 
-# Advisory explanation by NVIDIA Nemotron on Nebius Token Factory. Never changes the
-# verdict and never fails the pipeline. Needs NEBIUS_API_KEY (masked) and NEBIUS_MODEL_ID.
+# Advisory explanation by NVIDIA Nemotron via an OpenAI-compatible endpoint (Nebius Token
+# Factory by default). Never changes the verdict and never fails the pipeline.
+# Needs NEBIUS_API_KEY (masked), NEBIUS_MODEL_ID and optionally NEBIUS_BASE_URL.
 infrasec:explain:
   stage: .post
   image: python:3.12-slim

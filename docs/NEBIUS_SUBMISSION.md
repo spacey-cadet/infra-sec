@@ -1,7 +1,15 @@
 # Nebius x NVIDIA submission kit (deadline Oct 30, 8:00 pm Nairobi time)
 
+## Disclosure
+
+This submission was run end to end against NVIDIA-hosted Nemotron (base URL
+`https://integrate.api.nvidia.com/v1`), not Nebius Token Factory. Token Factory is the
+default endpoint in the code, but I could not create a verified account in time, so I
+have no live Token Factory run to show. I'm submitting anyway so the integration can be
+judged, and I understand it may not meet the Nebius requirement.
+
 ## Checklist (from the official Devpost page)
-- [ ] Runs on Nebius Token Factory and uses an NVIDIA open source model (Nemotron): infrasec_explain.py
+- [ ] Runs on Nebius Token Factory: NOT MET (ran on NVIDIA-hosted Nemotron, see Disclosure)
 - [ ] Track chosen: Coding and Agentic Engineering
 - [ ] Project description (adapt devpost-submission.md)
 - [ ] Working demo URL (see note below)

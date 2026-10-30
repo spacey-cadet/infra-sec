@@ -2,7 +2,7 @@
 """Nemotron proposes a Terraform fix; the deterministic gate must agree before it is kept.
 
 Flow (only for a held change whose findings are ALL auto-fixable):
-  1. Ask an NVIDIA Nemotron model on Nebius Token Factory for the corrected .tf file.
+  1. Ask an NVIDIA Nemotron model (OpenAI-compatible endpoint, Nebius by default) for the corrected .tf file.
   2. Guardrails: .tf file only, small diff, same set of resources.
   3. Write the file, regenerate the plan, re-run the deterministic evaluator.
   4. Gate says auto_apply -> keep (and commit with --commit). Otherwise revert.
@@ -133,7 +133,7 @@ def commit(tf: Path) -> None:
 
 
 def note(body: str) -> None:
-    text = ("**Fix proposed by NVIDIA Nemotron on Nebius Token Factory** "
+    text = (f"**Fix proposed by NVIDIA Nemotron on {ex.provider_label()}** "
             "(the deterministic gate re-checks every proposal)\n\n" + body)
     print(text)
     try:

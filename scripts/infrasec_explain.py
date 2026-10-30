@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Advisory explanation of an InfraSec decision, written by an NVIDIA Nemotron
-model served on Nebius Token Factory.
+model behind an OpenAI-compatible endpoint (Nebius Token Factory by default).
 
 The verdict (auto_apply / hold) always comes from the deterministic evaluator.
 This script only EXPLAINS it: what changed, why it was held, and a rollback
@@ -40,10 +40,22 @@ SYSTEM_PROMPT = (
     "'### Rollback plan'. Keep it under 250 words."
 )
 
-NOTE_HEADER = (
-    "**Explanation by NVIDIA Nemotron on Nebius Token Factory** "
-    "(advisory only; the verdict comes from the deterministic evaluator)"
-)
+def provider_label():
+    """Name the provider from NEBIUS_BASE_URL so a non-Nebius run is labelled honestly."""
+    base = os.environ.get("NEBIUS_BASE_URL", DEFAULT_BASE_URL)
+    host = (urllib.parse.urlparse(base).hostname or "").lower()
+    if host == "nebius.com" or host.endswith(".nebius.com"):
+        return "Nebius Token Factory"
+    if host == "nvidia.com" or host.endswith(".nvidia.com"):
+        return "NVIDIA-hosted API (not Nebius)"
+    return host or "an OpenAI-compatible endpoint"
+
+
+def note_header():
+    return (
+        f"**Explanation by NVIDIA Nemotron on {provider_label()}** "
+        "(advisory only; the verdict comes from the deterministic evaluator)"
+    )
 
 
 def clip(text, limit):
@@ -82,7 +94,7 @@ def call_model(base_url, api_key, model, messages):
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 900}
-    data = _request(url, headers, body)
+    data = _request(url, headers, body, timeout=120)
     return strip_reasoning(data["choices"][0]["message"]["content"] or "")
 
 
@@ -160,7 +172,7 @@ def main(argv=None):
         if not answer:
             print("Model returned no text; skipping.")
             return 0
-        note = f"{NOTE_HEADER}\n\n{answer}"
+        note = f"{note_header()}\n\n{answer}"
         print(note)
         post_note(note)
     except (urllib.error.URLError, KeyError, ValueError, OSError) as exc:
